@@ -1,0 +1,302 @@
+import "./App.css";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { Sidebar } from "./components/Sidebar";
+import { UnlockScreen } from "./components/UnlockScreen";
+import { CreateNodeScreen } from "./components/CreateNodeScreen";
+import { ActivationScreen } from "./components/ActivationScreen";
+import { MyNodePanel } from "./components/MyNodePanel";
+import { WalletPanel } from "./components/WalletPanel";
+import { StakePanel } from "./components/StakePanel";
+import { SystemPanel } from "./components/SystemPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
+import { LogViewer } from "./components/LogViewer";
+
+export type Panel = "my-node" | "wallet" | "stake" | "system" | "settings" | "logs";
+
+export interface LogLine {
+  timestamp: string;
+  level: string;
+  message: string;
+}
+
+export interface CommandResult {
+  success: boolean;
+  output: string;
+  error: string | null;
+}
+
+export interface NodeStatus {
+  running: boolean;
+  peer_id: string | null;
+  tier: number | null;
+  wallet: string | null;
+  balance_sol: number | null;
+  balance_syn: number | null;
+  staked_syn: number | null;
+  pid: number | null;
+}
+
+interface WalletExistsResult {
+  exists: boolean;
+  wallet_path: string;
+  config_exists: boolean;
+}
+
+export interface ChainInfo {
+  wallet: string | null;
+  sol: number;
+  syn: number;
+  staked: number;
+  rewardsPending: number;
+  stakeAccountExists: boolean;
+  stakeLockedUntil: number;
+  tokenAccountExists: boolean;
+  coordinatorReachable: boolean;
+  vaultClaimableSyn: number;
+  rewardsByType: Record<string, number>;
+  presencePoints: number;
+  totalWins: number;
+  totalSubmissions: number;
+  unclaimedSyn: number;
+  totalClaimedSyn: number;
+  canaryStrikes: number;
+  anomalyWarnings: number;
+  attestationFailures: number;
+  tier: number | null;
+  nodeName: string | null;
+}
+
+type BootPhase = "checking" | "needs-create" | "needs-unlock" | "unlocked" | "needs-activation";
+
+function App() {
+  const [bootPhase, setBootPhase] = useState<BootPhase>("checking");
+  const [password, setPassword] = useState<string | null>(null);
+  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [bootError, setBootError] = useState<string | null>(null);
+  const [activePanel, setActivePanel] = useState<Panel>("my-node");
+  const mainRef = useRef<HTMLElement | null>(null);
+
+  // Reset scroll to the top whenever the active panel changes. Without this
+  // the <main> container keeps its previous scrollTop, so switching into a
+  // long page (Stake, Wallet) can land mid-screen and the user swears the
+  // header is missing. `useLayoutEffect` not needed — the next tick is fine
+  // and keeps the reset off the render-critical path.
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+  }, [activePanel]);
+  const [nodeStatus, setNodeStatus] = useState<NodeStatus>({
+    running: false,
+    peer_id: null,
+    tier: null,
+    wallet: null,
+    balance_sol: null,
+    balance_syn: null,
+    staked_syn: null,
+    pid: null,
+  });
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [chainInfo, setChainInfo] = useState<ChainInfo | null>(null);
+
+  // Decide at boot whether we're creating a wallet or unlocking one.
+  useEffect(() => {
+    (async () => {
+      try {
+        const info = await invoke<WalletExistsResult>("wallet_exists");
+        setBootPhase(info.exists ? "needs-unlock" : "needs-create");
+      } catch (e) {
+        setBootError(e instanceof Error ? e.message : String(e));
+        setBootPhase("needs-create");
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<LogLine>("node-log", (event) => {
+      setLogs((prev) => {
+        const next = [...prev, event.payload];
+        return next.slice(-2000);
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Runtime-only fields come from the Rust side (running, pid).
+  useEffect(() => {
+    if (!nodeStatus.running) return;
+    const interval = setInterval(async () => {
+      try {
+        const status = await invoke<NodeStatus>("node_status");
+        setNodeStatus((prev) => ({ ...prev, running: status.running, pid: status.pid }));
+      } catch (e) {
+        console.error("Failed to get node status", e);
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [nodeStatus.running]);
+
+  // One refresh function, shared with every panel that has a Refresh
+  // button. Child panels used to `invoke("fetch_chain_info")` directly,
+  // which hit the Rust backend but never propagated the result up here —
+  // so nothing on screen updated until the next 15 s poll tick.
+  const refreshChainInfo = useCallback(async () => {
+    try {
+      const info = await invoke<ChainInfo>("fetch_chain_info");
+      setChainInfo(info);
+      setNodeStatus((prev) => ({
+        ...prev,
+        wallet: info.wallet ?? prev.wallet,
+        tier: info.tier ?? prev.tier,
+        balance_sol: info.sol,
+        balance_syn: info.syn,
+        staked_syn: info.staked,
+      }));
+    } catch (e) {
+      console.warn("[refresh] fetch_chain_info failed:", e);
+    }
+  }, []);
+
+  // Chain/wallet fields come from the lightweight `chain-info` helper on
+  // the Rust side (NestJS-free, no coordinator heartbeat). The poll just
+  // delegates to refreshChainInfo so there's a single source of truth.
+  useEffect(() => {
+    if (bootPhase !== "unlocked" && bootPhase !== "needs-activation") return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
+      await refreshChainInfo();
+    };
+    tick();
+    const id = setInterval(tick, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [bootPhase, refreshChainInfo]);
+
+  const handleUnlock = useCallback((pwd: string, walletAddr: string) => {
+    setPassword(pwd);
+    setWalletAddress(walletAddr);
+    // Advance immediately so the UnlockScreen unmounts — otherwise its
+    // "Unlocking..." spinner stays visible while the balance check runs.
+    setBootPhase("unlocked");
+
+    // Background activation check via the lightweight chain-info helper.
+    // Fail SAFE: only route to ActivationScreen when we have POSITIVE
+    // evidence the wallet is unactivated (SOL came back as 0 on a
+    // successful RPC call). Any RPC hiccup keeps the user on the dashboard.
+    (async () => {
+      try {
+        const info = await invoke<ChainInfo>("fetch_chain_info");
+        if (info.sol < 0.001 && !info.tokenAccountExists) {
+          setBootPhase("needs-activation");
+        }
+      } catch (e) {
+        console.warn("[unlock] background chain-info check failed:", e);
+      }
+    })();
+  }, []);
+
+  const handleCreated = useCallback((pwd: string, walletAddr: string) => {
+    setPassword(pwd);
+    setWalletAddress(walletAddr);
+    // Brand-new wallets need a small SOL deposit before they can earn rewards.
+    setBootPhase("needs-activation");
+  }, []);
+
+  const handleStartNode = useCallback(async () => {
+    if (!password) return;
+    try {
+      const status = await invoke<NodeStatus>("start_node", { password });
+      setNodeStatus(status);
+    } catch (e) {
+      console.error("Failed to start node", e);
+    }
+  }, [password]);
+
+  const handleStopNode = useCallback(async () => {
+    try {
+      await invoke("stop_node");
+      setNodeStatus((prev) => ({ ...prev, running: false, pid: null }));
+    } catch (e) {
+      console.error("Failed to stop node", e);
+    }
+  }, []);
+
+  if (bootPhase === "checking") {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-[var(--bg-primary)] text-slate-400">
+        <p>Checking wallet…</p>
+        {bootError && <p className="text-red-400 text-xs mt-2">{bootError}</p>}
+      </div>
+    );
+  }
+
+  if (bootPhase === "needs-create") {
+    return <CreateNodeScreen onCreated={handleCreated} />;
+  }
+
+  if (bootPhase === "needs-unlock") {
+    return <UnlockScreen onUnlock={handleUnlock} />;
+  }
+
+  if (bootPhase === "needs-activation" && walletAddress && password) {
+    return (
+      <ActivationScreen
+        walletAddress={walletAddress}
+        password={password}
+        onActivated={() => {
+          setBootPhase("unlocked");
+          handleStartNode();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-screen text-slate-100 font-mono">
+      <Sidebar
+        activePanel={activePanel}
+        onPanelChange={setActivePanel}
+        nodeRunning={nodeStatus.running}
+      />
+      <main ref={mainRef} className="flex-1 overflow-auto p-6">
+        {activePanel === "my-node" && (
+          <MyNodePanel
+            password={password}
+            chainInfo={chainInfo}
+            status={nodeStatus}
+            onStart={handleStartNode}
+            onStop={handleStopNode}
+            onOpenLogs={() => setActivePanel("logs")}
+            onRefresh={refreshChainInfo}
+          />
+        )}
+        {activePanel === "wallet" && (
+          <WalletPanel
+            password={password}
+            status={nodeStatus}
+            chainInfo={chainInfo}
+            onRefresh={refreshChainInfo}
+          />
+        )}
+        {activePanel === "stake" && (
+          <StakePanel
+            password={password}
+            status={nodeStatus}
+            chainInfo={chainInfo}
+            onRefresh={refreshChainInfo}
+          />
+        )}
+        {activePanel === "system" && <SystemPanel />}
+        {activePanel === "settings" && <SettingsPanel password={password} />}
+        {activePanel === "logs" && <LogViewer logs={logs} />}
+      </main>
+    </div>
+  );
+}
+
+export default App;

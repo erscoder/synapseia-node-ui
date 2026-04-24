@@ -1,0 +1,1199 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter, State};
+
+// Hard cap for quick, read-only CLI invocations (wallet-verify, config, etc).
+// 30 s is generous for a NestJS cold start but prevents an indefinite UI hang.
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+
+// On-chain write commands — stake/unstake/claim/deposit/withdraw — block on
+// `confirmed` commitment which routinely takes 20-60 s. Anything less than
+// ~90 s produces spurious "command timed out" errors for txs that DID land.
+const ON_CHAIN_CLI_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Commands that send on-chain transactions and must use the longer timeout.
+const ON_CHAIN_COMMANDS: &[&str] = &[
+    "stake",
+    "unstake",
+    "claim-rewards",
+    "claim-wo-rewards",
+    "withdraw-sol",
+    "withdraw-syn",
+    "deposit-sol",
+    "deposit-syn",
+];
+
+fn timeout_for(command: &str) -> Duration {
+    if ON_CHAIN_COMMANDS.contains(&command) {
+        ON_CHAIN_CLI_TIMEOUT
+    } else {
+        CLI_TIMEOUT
+    }
+}
+
+pub struct NodeProcess {
+    child: Option<Child>,
+    logs: Arc<Mutex<Vec<String>>>,
+}
+
+impl NodeProcess {
+    pub fn new() -> Self {
+        Self {
+            child: None,
+            logs: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+pub type NodeProcessState = Arc<Mutex<NodeProcess>>;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NodeStatus {
+    pub running: bool,
+    pub peer_id: Option<String>,
+    pub tier: Option<u32>,
+    pub wallet: Option<String>,
+    pub balance_sol: Option<f64>,
+    pub balance_syn: Option<f64>,
+    pub staked_syn: Option<f64>,
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CommandResult {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LogLine {
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UnlockResult {
+    pub success: bool,
+    pub wallet_address: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WalletExists {
+    pub exists: bool,
+    pub wallet_path: String,
+    pub config_exists: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExternalNodeInfo {
+    /// True when a node is running outside of this Tauri process's control.
+    /// i.e. the lock file exists, the PID is alive, and it isn't the child
+    /// we spawned ourselves.
+    pub external: bool,
+    pub pid: Option<u32>,
+    pub source: Option<String>,
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    pub os: String,
+    pub cpu_model: String,
+    pub cpu_cores: u32,
+    pub ram_gb: f64,
+    pub gpu_type: Option<String>,
+    pub gpu_vram_gb: Option<f64>,
+    pub recommended_tier: u8,
+    pub has_ollama: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainInfo {
+    pub wallet: Option<String>,
+    pub sol: f64,
+    pub syn: f64,
+    // Direct on-chain StakeAccount reads (matches the dashboard).
+    pub staked: f64,
+    pub rewards_pending: f64,
+    pub stake_account_exists: bool,
+    pub stake_locked_until: i64,
+    pub token_account_exists: bool,
+    pub coordinator_reachable: bool,
+    // On-chain RewardAccount PDA (syn_rewards_vault program) + coordinator
+    // breakdown per reward type. This is the pool the dashboard's Claim
+    // button targets.
+    pub vault_claimable_syn: f64,
+    #[serde(default)]
+    pub rewards_by_type: std::collections::HashMap<String, f64>,
+    // Stats pulled from the coordinator — zero when the node is unknown.
+    pub presence_points: f64,
+    pub total_wins: f64,
+    pub total_submissions: f64,
+    pub unclaimed_syn: f64,
+    pub total_claimed_syn: f64,
+    pub canary_strikes: f64,
+    pub anomaly_warnings: f64,
+    pub attestation_failures: f64,
+    pub tier: Option<i32>,
+    pub node_name: Option<String>,
+}
+
+// ─── Wallet lifecycle ────────────────────────────────────────────────────────
+// The session password lives in React memory only and is never persisted by
+// the Rust side. If a future version wants keychain-backed auto-unlock, add
+// the `keyring` crate commands back — they were removed to avoid a deceptive
+// "password stored somewhere" surface.
+
+fn synapseia_home() -> PathBuf {
+    if let Ok(dir) = std::env::var("SYNAPSEIA_HOME") {
+        return PathBuf::from(dir);
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".synapseia")
+}
+
+#[tauri::command]
+pub async fn wallet_exists() -> Result<WalletExists, String> {
+    let home = synapseia_home();
+    let wallet_path = home.join("wallet.json");
+    let config_path = home.join("config.json");
+    Ok(WalletExists {
+        exists: wallet_path.exists(),
+        wallet_path: wallet_path.to_string_lossy().to_string(),
+        config_exists: config_path.exists(),
+    })
+}
+
+/// Hardware introspection without spawning anything. Uses the `sysinfo`
+/// crate directly so the SystemPanel is instant — no CLI bootstrap, no
+/// coordinator round trip. GPU detection is macOS-specific via `system_profiler`.
+#[tauri::command]
+pub async fn system_info() -> Result<SystemInfo, String> {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+
+    let cpu_model = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let cpu_cores = sys.cpus().len() as u32;
+    let ram_gb = (sys.total_memory() as f64) / 1_073_741_824.0;
+    let os = format!(
+        "{} {}",
+        System::name().unwrap_or_else(|| "Unknown".to_string()),
+        System::os_version().unwrap_or_default()
+    );
+
+    let (gpu_type, gpu_vram_gb) = detect_gpu();
+    let has_ollama = which_in_path("ollama").is_some();
+
+    // Tier recommendation mirrors packages/node/src/modules/hardware — a
+    // rough VRAM bucketing so users see "Tier 2 · 16GB GPU" not a raw number.
+    let vram = gpu_vram_gb.unwrap_or(0.0);
+    let recommended_tier: u8 = if vram >= 80.0 {
+        5
+    } else if vram >= 32.0 {
+        4
+    } else if vram >= 24.0 {
+        3
+    } else if vram >= 16.0 {
+        2
+    } else if vram >= 8.0 {
+        1
+    } else {
+        0
+    };
+
+    Ok(SystemInfo {
+        os,
+        cpu_model,
+        cpu_cores,
+        ram_gb,
+        gpu_type,
+        gpu_vram_gb,
+        recommended_tier,
+        has_ollama,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn detect_gpu() -> (Option<String>, Option<f64>) {
+    // system_profiler SPDisplaysDataType prints one of many shapes; we grab
+    // the first "Chipset Model:" and "VRAM (Total):" / "Metal Support:" lines.
+    let Ok(out) = std::process::Command::new("system_profiler")
+        .arg("SPDisplaysDataType")
+        .output()
+    else {
+        return (None, None);
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut chipset: Option<String> = None;
+    let mut vram: Option<f64> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if chipset.is_none() {
+            if let Some(rest) = line.strip_prefix("Chipset Model:") {
+                chipset = Some(rest.trim().to_string());
+            }
+        }
+        if vram.is_none() {
+            if let Some(rest) = line
+                .strip_prefix("VRAM (Total):")
+                .or_else(|| line.strip_prefix("VRAM (Dynamic, Max):"))
+            {
+                vram = parse_vram_gb(rest.trim());
+            }
+        }
+    }
+    // Apple Silicon has no discrete VRAM; Metal uses unified memory. Fall
+    // back to total RAM so tier recommendation still works there.
+    if chipset.is_some() && vram.is_none() {
+        // Conservative: report unified memory size as VRAM for tier purposes.
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        vram = Some((sys.total_memory() as f64) / 1_073_741_824.0);
+    }
+    (chipset, vram)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_gpu() -> (Option<String>, Option<f64>) {
+    (None, None)
+}
+
+fn parse_vram_gb(s: &str) -> Option<f64> {
+    // e.g. "8 GB", "8192 MB"
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let n: f64 = tokens[0].parse().ok()?;
+    match tokens[1].to_uppercase().as_str() {
+        "GB" => Some(n),
+        "MB" => Some(n / 1024.0),
+        "KB" => Some(n / 1_048_576.0),
+        _ => None,
+    }
+}
+
+/// Lightweight chain poll. Spawns the node CLI's `chain-info` subcommand,
+/// which short-circuits BEFORE NestJS bootstrap and queries Solana directly.
+/// No P2P handshakes, no heartbeats, no coordinator noise — just the numbers.
+#[tauri::command]
+pub async fn fetch_chain_info() -> Result<ChainInfo, String> {
+    let mut cmd = build_node_command(&["chain-info"])?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+
+    let output = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("spawn failed: {}", e)),
+        Err(_) => return Err(format!("chain-info timed out after {}s", CLI_TIMEOUT.as_secs())),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The helper emits exactly one `__CHAIN_INFO__ {json}` line. Scan for it
+    // so any pre-line noise (e.g. the `bigint: Failed to load bindings`
+    // startup warning on Node 22+) is ignored.
+    for line in stdout.lines() {
+        if let Some(idx) = line.find("__CHAIN_INFO__") {
+            let json = line[idx + "__CHAIN_INFO__".len()..].trim();
+            return serde_json::from_str::<ChainInfo>(json)
+                .map_err(|e| format!("failed to parse chain-info payload: {}", e));
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Err(format!(
+        "chain-info produced no __CHAIN_INFO__ line (stderr: {})",
+        stderr.lines().last().unwrap_or("<empty>")
+    ))
+}
+
+/// Report whether a Synapseia node is running *outside* this Tauri process.
+/// We read ~/.synapseia/node.lock (written by the CLI `start` command or by
+/// our own start_node) and, if the PID is still alive, return it — but ONLY
+/// if it isn't our own child. The Dashboard polls this to show a banner when
+/// the user starts a node from the terminal while the desktop app is open.
+#[tauri::command]
+pub async fn external_node_info(
+    state: State<'_, NodeProcessState>,
+) -> Result<ExternalNodeInfo, String> {
+    let our_pid = {
+        let node = state.lock().await;
+        node.child.as_ref().and_then(|c| c.id())
+    };
+    Ok(read_external_lock(our_pid).unwrap_or(ExternalNodeInfo {
+        external: false,
+        pid: None,
+        source: None,
+        started_at: None,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LockFile {
+    pid: u32,
+    #[serde(rename = "startedAt")]
+    started_at: String,
+    source: String,
+}
+
+fn read_external_lock(our_pid: Option<u32>) -> Option<ExternalNodeInfo> {
+    let lock_path = synapseia_home().join("node.lock");
+    if !lock_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&lock_path).ok()?;
+    let lock: LockFile = serde_json::from_str(&content).ok()?;
+    if !is_pid_alive(lock.pid) {
+        // Stale — let the CLI clean it up on next start; we just ignore.
+        return None;
+    }
+    if our_pid == Some(lock.pid) {
+        // The running node is our own child, not external.
+        return None;
+    }
+    Some(ExternalNodeInfo {
+        external: true,
+        pid: Some(lock.pid),
+        source: Some(lock.source),
+        started_at: Some(lock.started_at),
+    })
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // Rust std doesn't wrap kill(2) directly and we'd rather not pull in
+    // `nix` just for this. `kill -0 <pid>` does an existence + permission
+    // check without actually signalling, runs in <1ms, and is present on
+    // every Unix we ship to (macOS, Linux).
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        return matches!(status, Ok(s) if s.success());
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Validate a password by asking the node CLI to decrypt the wallet.
+/// Returns structured success/failure so the UI can show proper errors.
+#[tauri::command]
+pub async fn unlock_wallet(password: String) -> Result<UnlockResult, String> {
+    if password.is_empty() {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("EMPTY_PASSWORD".to_string()),
+            error_message: Some("Password is required.".to_string()),
+        });
+    }
+
+    let mut cmd = build_node_command(&["wallet-verify"])?;
+    cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+
+    let output = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Ok(UnlockResult {
+                success: false,
+                wallet_address: None,
+                error_code: Some("SPAWN_FAILED".to_string()),
+                error_message: Some(format!(
+                    "Failed to run node CLI. Is Node.js installed? {}",
+                    e
+                )),
+            });
+        }
+        Err(_) => {
+            return Ok(UnlockResult {
+                success: false,
+                wallet_address: None,
+                error_code: Some("TIMEOUT".to_string()),
+                error_message: Some(format!(
+                    "wallet-verify timed out after {}s. Check Console.app for the node CLI log.",
+                    CLI_TIMEOUT.as_secs()
+                )),
+            });
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{}\n{}", stdout, stderr);
+    eprintln!(
+        "[synapseia-node-ui] unlock_wallet exit={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        stdout.chars().take(400).collect::<String>(),
+        stderr.chars().take(400).collect::<String>()
+    );
+
+    // Rust cannot trust the exit code alone because the node CLI bootstrap
+    // logs noise on stderr; match the sentinel markers written by
+    // wallet-verify for an unambiguous answer.
+    if combined.contains("INVALID_PASSWORD") {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("INVALID_PASSWORD".to_string()),
+            error_message: Some("Incorrect password.".to_string()),
+        });
+    }
+    if combined.contains("WALLET_NOT_FOUND") {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("WALLET_NOT_FOUND".to_string()),
+            error_message: Some("No wallet found. Create one first.".to_string()),
+        });
+    }
+
+    if let Some(addr) = extract_pubkey(&combined) {
+        return Ok(UnlockResult {
+            success: true,
+            wallet_address: Some(addr),
+            error_code: None,
+            error_message: None,
+        });
+    }
+
+    Ok(UnlockResult {
+        success: false,
+        wallet_address: None,
+        error_code: Some("UNKNOWN".to_string()),
+        error_message: Some(format!(
+            "Failed to verify wallet. stderr: {}",
+            stderr.lines().last().unwrap_or("<empty>")
+        )),
+    })
+}
+
+#[tauri::command]
+pub async fn create_wallet(
+    password: String,
+    node_name: String,
+    coordinator_url: String,
+    model: Option<String>,
+    llm_url: Option<String>,
+    llm_key: Option<String>,
+) -> Result<UnlockResult, String> {
+    if password.len() < 8 {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("PASSWORD_TOO_SHORT".to_string()),
+            error_message: Some("Password must be at least 8 characters.".to_string()),
+        });
+    }
+    if node_name.trim().is_empty() {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("INVALID_NAME".to_string()),
+            error_message: Some("Node name is required.".to_string()),
+        });
+    }
+    if !coordinator_url.starts_with("http://") && !coordinator_url.starts_with("https://") {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("INVALID_COORDINATOR".to_string()),
+            error_message: Some("Coordinator URL must start with http:// or https://.".to_string()),
+        });
+    }
+
+    let mut args: Vec<String> = vec![
+        "wallet-create".to_string(),
+        "--name".to_string(),
+        node_name,
+        "--coordinator-url".to_string(),
+        coordinator_url,
+    ];
+    if let Some(m) = model {
+        if !m.is_empty() {
+            args.push("--model".to_string());
+            args.push(m);
+        }
+    }
+    if let Some(u) = llm_url {
+        if !u.is_empty() {
+            args.push("--llm-url".to_string());
+            args.push(u);
+        }
+    }
+    if let Some(k) = llm_key {
+        if !k.is_empty() {
+            args.push("--llm-key".to_string());
+            args.push(k);
+        }
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut cmd = build_node_command(&arg_refs)?;
+    cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+
+    let output = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Ok(UnlockResult {
+                success: false,
+                wallet_address: None,
+                error_code: Some("SPAWN_FAILED".to_string()),
+                error_message: Some(format!(
+                    "Failed to run node CLI. Is Node.js installed? {}",
+                    e
+                )),
+            });
+        }
+        Err(_) => {
+            return Ok(UnlockResult {
+                success: false,
+                wallet_address: None,
+                error_code: Some("TIMEOUT".to_string()),
+                error_message: Some(format!(
+                    "wallet-create timed out after {}s.",
+                    CLI_TIMEOUT.as_secs()
+                )),
+            });
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{}\n{}", stdout, stderr);
+    eprintln!(
+        "[synapseia-node-ui] create_wallet exit={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        stdout.chars().take(400).collect::<String>(),
+        stderr.chars().take(400).collect::<String>()
+    );
+
+    if combined.contains("WALLET_ALREADY_EXISTS") {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("WALLET_ALREADY_EXISTS".to_string()),
+            error_message: Some(
+                "A wallet already exists. Unlock with your existing password instead.".to_string(),
+            ),
+        });
+    }
+    if combined.contains("PASSWORD_TOO_SHORT") {
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("PASSWORD_TOO_SHORT".to_string()),
+            error_message: Some("Password must be at least 8 characters.".to_string()),
+        });
+    }
+
+    if let Some(addr) = extract_pubkey(&combined) {
+        return Ok(UnlockResult {
+            success: true,
+            wallet_address: Some(addr),
+            error_code: None,
+            error_message: None,
+        });
+    }
+
+    // Surface the actual node stderr so users see why it failed
+    let last_err = stderr
+        .lines()
+        .rev()
+        .find(|l| l.contains("ERROR") || l.contains("Error"))
+        .unwrap_or("");
+    Ok(UnlockResult {
+        success: false,
+        wallet_address: None,
+        error_code: Some("CREATE_FAILED".to_string()),
+        error_message: Some(if last_err.is_empty() {
+            format!("Wallet creation failed. stderr: {}", stderr.trim())
+        } else {
+            last_err.to_string()
+        }),
+    })
+}
+
+// ─── Node Process Commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn start_node(
+    password: String,
+    app: AppHandle,
+    state: State<'_, NodeProcessState>,
+) -> Result<NodeStatus, String> {
+    let mut node = state.lock().await;
+
+    if node.child.is_some() {
+        return Err("Node is already running".to_string());
+    }
+
+    // Refuse to double-start if the CLI (or another desktop instance) has
+    // already claimed the lock on this machine.
+    if let Some(info) = read_external_lock(None) {
+        return Err(format!(
+            "A Synapseia node is already running {} (PID {}). Stop it first.",
+            if info.source.as_deref() == Some("ui") {
+                "from another desktop session"
+            } else {
+                "from the CLI"
+            },
+            info.pid.unwrap_or(0)
+        ));
+    }
+
+    let mut cmd = build_node_command(&["start"])?;
+    cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password)
+        .env("SYNAPSEIA_LAUNCH_SOURCE", "ui")
+        .env("NODE_ENV", "production")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn node process: {}", e))?;
+
+    let pid = child.id();
+
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    node.child = Some(child);
+    let logs = node.logs.clone();
+
+    drop(node);
+
+    if let (Some(stdout), Some(stderr)) = (child_stdout, child_stderr) {
+        let app_out = app.clone();
+        let app_err = app.clone();
+        let logs_out = logs.clone();
+        let logs_err = logs.clone();
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(raw)) = reader.next_line().await {
+                let (level_override, message) = sanitise_log_line(&raw, "stdout");
+                let log = LogLine {
+                    timestamp: now_hhmmss(),
+                    level: level_override,
+                    message,
+                };
+                logs_out
+                    .lock()
+                    .await
+                    .push(format!("[{}] {}", log.timestamp, log.message));
+                let _ = app_out.emit("node-log", &log);
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(raw)) = reader.next_line().await {
+                let (level_override, message) = sanitise_log_line(&raw, "stderr");
+                let log = LogLine {
+                    timestamp: now_hhmmss(),
+                    level: level_override,
+                    message,
+                };
+                logs_err
+                    .lock()
+                    .await
+                    .push(format!("[{}] [{}] {}", log.timestamp, log.level, log.message));
+                let _ = app_err.emit("node-log", &log);
+            }
+        });
+    }
+
+    Ok(NodeStatus {
+        running: true,
+        peer_id: None,
+        tier: None,
+        wallet: None,
+        balance_sol: None,
+        balance_syn: None,
+        staked_syn: None,
+        pid,
+    })
+}
+
+#[tauri::command]
+pub async fn stop_node(state: State<'_, NodeProcessState>) -> Result<bool, String> {
+    let mut node = state.lock().await;
+    if let Some(mut child) = node.child.take() {
+        child.kill().await.map_err(|e| e.to_string())?;
+        cleanup_lock_if_ours(child.id());
+        Ok(true)
+    } else {
+        Err("No node running".to_string())
+    }
+}
+
+/// Synchronous reap of any spawned node child. Called from the Tauri exit
+/// event handler where `.await` is not available — we use `start_kill()`
+/// which dispatches SIGKILL without blocking.
+pub fn reap_on_exit(state: &NodeProcessState) {
+    // `blocking_lock` waits for any in-flight async task (log streaming,
+    // status poll) to release the mutex before we proceed. This is safe in
+    // a shutdown context because those tasks hold the lock for microseconds
+    // at most, so we never block more than a few milliseconds. The old
+    // `try_lock` silently skipped the kill when any task happened to hold
+    // the lock, leaving the node process alive after the window closed.
+    let mut guard = state.blocking_lock();
+    if let Some(mut child) = guard.child.take() {
+        let pid = child.id();
+
+        // Give the Node.js process a brief window to shut down cleanly
+        // (flush logs, close WS connections) before we force-kill it.
+        #[cfg(unix)]
+        if let Some(p) = pid {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(p.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            // Wait up to 2 s for graceful exit before escalating to SIGKILL.
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !is_pid_alive(p) {
+                    eprintln!("[synapseia-node-ui] reap_on_exit: pid={} exited cleanly", p);
+                    cleanup_lock_if_ours(pid);
+                    return;
+                }
+            }
+        }
+
+        let _ = child.start_kill();
+        eprintln!("[synapseia-node-ui] reap_on_exit: killed child pid={:?}", pid);
+        cleanup_lock_if_ours(pid);
+    }
+}
+
+/// Remove ~/.synapseia/node.lock only if it still belongs to the PID we
+/// just reaped. Another process (CLI user) may have reclaimed the stale
+/// lock between our write and exit — don't evict them.
+fn cleanup_lock_if_ours(our_pid: Option<u32>) {
+    let Some(pid) = our_pid else { return };
+    let path = synapseia_home().join("node.lock");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(lock) = serde_json::from_str::<LockFile>(&content) else {
+        return;
+    };
+    if lock.pid == pid {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("[synapseia-node-ui] released lock at {}", path.display());
+    }
+}
+
+#[tauri::command]
+pub async fn node_status(state: State<'_, NodeProcessState>) -> Result<NodeStatus, String> {
+    let node = state.lock().await;
+    let running = node.child.is_some();
+    let pid = node.child.as_ref().and_then(|c| c.id());
+
+    Ok(NodeStatus {
+        running,
+        peer_id: None,
+        tier: None,
+        wallet: None,
+        balance_sol: None,
+        balance_syn: None,
+        staked_syn: None,
+        pid,
+    })
+}
+
+#[tauri::command]
+pub async fn get_node_logs(state: State<'_, NodeProcessState>) -> Result<Vec<String>, String> {
+    let node = state.lock().await;
+    let logs = node.logs.lock().await.clone();
+    Ok(logs)
+}
+
+#[tauri::command]
+pub async fn run_command(
+    command: String,
+    args: Vec<String>,
+    password: Option<String>,
+) -> Result<CommandResult, String> {
+    let mut all_args: Vec<String> = vec![command.clone()];
+    all_args.extend(args);
+    let arg_refs: Vec<&str> = all_args.iter().map(|s| s.as_str()).collect();
+
+    let mut cmd = build_node_command(&arg_refs)?;
+    if let Some(ref pwd) = password {
+        cmd.env("SYNAPSEIA_WALLET_PASSWORD", pwd);
+    }
+    cmd.env("NODE_ENV", "production");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+
+    let effective_timeout = timeout_for(&command);
+    let output = match tokio::time::timeout(effective_timeout, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Ok(CommandResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Failed to run node CLI ({}): {}. Is Node.js installed?",
+                    command, e
+                )),
+            });
+        }
+        Err(_) => {
+            return Ok(CommandResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Command `{}` timed out after {}s.",
+                    command,
+                    effective_timeout.as_secs()
+                )),
+            });
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok(CommandResult {
+            success: true,
+            output: stdout,
+            error: None,
+        })
+    } else {
+        Ok(CommandResult {
+            success: false,
+            output: stdout,
+            error: Some(stderr),
+        })
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Build a tokio Command that invokes `node <dist/index.js> <args...>` with:
+///   - an augmented PATH (GUI apps on macOS don't inherit shell PATH)
+///   - the located @synapseia/node script
+fn build_node_command(args: &[&str]) -> Result<Command, String> {
+    let node_path = find_synapseia_node()?;
+    let script_path = format!("{}/dist/index.js", node_path);
+
+    let node_bin = locate_node_binary()
+        .ok_or_else(|| "Could not find the `node` binary. Install Node.js (>=18) — e.g. `brew install node` — then relaunch Synapseia Node.".to_string())?;
+
+    let mut cmd = Command::new(&node_bin);
+    cmd.arg(&script_path);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.env("PATH", augmented_path());
+    Ok(cmd)
+}
+
+/// Find a `node` binary even when the app was launched from Finder (where
+/// PATH is usually just `/usr/bin:/bin:/usr/sbin:/sbin`).
+fn locate_node_binary() -> Option<PathBuf> {
+    // 1. respect an explicit override
+    if let Ok(p) = std::env::var("SYNAPSEIA_NODE_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+
+    // 2. check well-known install locations (ordered by likelihood on macOS)
+    let mut candidates: Vec<PathBuf> = vec![
+        PathBuf::from("/opt/homebrew/bin/node"),    // Apple Silicon brew
+        PathBuf::from("/usr/local/bin/node"),       // Intel brew / generic
+        PathBuf::from("/usr/bin/node"),
+        PathBuf::from("/snap/bin/node"),            // Linux snap
+    ];
+
+    // nvm installs live under ~/.nvm/versions/node/<ver>/bin/node — probe the
+    // `current` symlink first, then the latest numeric version we can see.
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".nvm/current/bin/node"));
+        let nvm_root = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_root) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|d| d.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            // Sort descending so the newest version wins
+            versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            for v in versions {
+                candidates.push(v.join("bin/node"));
+            }
+        }
+        // Volta
+        candidates.push(home.join(".volta/bin/node"));
+        // fnm default shim
+        candidates.push(home.join(".local/share/fnm/aliases/default/bin/node"));
+    }
+
+    for c in candidates {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+
+    // 3. last resort — use whatever the augmented PATH resolves to
+    which_in_path("node")
+}
+
+fn which_in_path(binary: &str) -> Option<PathBuf> {
+    let path = augmented_path();
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = PathBuf::from(dir).join(binary);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn augmented_path() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
+    let mut extras = vec![
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        extras.push(home.join(".volta/bin").to_string_lossy().to_string());
+        extras.push(home.join(".nvm/current/bin").to_string_lossy().to_string());
+        // Add the newest nvm version bin/
+        let nvm_root = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_root) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|d| d.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            if let Some(v) = versions.first() {
+                extras.push(v.join("bin").to_string_lossy().to_string());
+            }
+        }
+    }
+    if base.is_empty() {
+        extras.join(":")
+    } else {
+        format!("{}:{}", extras.join(":"), base)
+    }
+}
+
+fn find_synapseia_node() -> Result<String, String> {
+    // 1. explicit override
+    if let Ok(p) = std::env::var("SYNAPSEIA_NODE_PATH") {
+        let pb = PathBuf::from(&p);
+        if pb.join("dist/index.js").exists() {
+            return Ok(p);
+        }
+    }
+
+    // 2. dev layout: src-tauri/../../.. up to packages/node (CARGO_MANIFEST_DIR
+    //    is baked in at compile-time; only valid while running from the dev
+    //    tree, but we still try it first because it's the cheapest check).
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(packages_dir) = manifest.parent().and_then(|p| p.parent()) {
+        let candidate = packages_dir.join("node");
+        if candidate.join("dist/index.js").exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    // 3. global npm installs (common dev machine) — try both possible node-binary
+    //    roots for @synapseia/node.
+    let npm_roots = [
+        "/opt/homebrew/lib/node_modules",
+        "/usr/local/lib/node_modules",
+    ];
+    for root in npm_roots {
+        let c = format!("{}/@synapseia/node", root);
+        if std::path::Path::new(&format!("{}/dist/index.js", c)).exists() {
+            return Ok(c);
+        }
+    }
+
+    Err(
+        "Could not locate @synapseia/node. Expected it at ../node relative to this binary or globally installed."
+            .to_string(),
+    )
+}
+
+fn extract_pubkey(s: &str) -> Option<String> {
+    // CLI emits `__WALLET_OK__ <pubkey>` on success. The sentinel is
+    // intentionally distinct so grep/regex on logs can't yield a false match.
+    const SENTINEL: &str = "__WALLET_OK__";
+    for line in s.lines() {
+        if let Some(rest) = line.find(SENTINEL) {
+            let tail = &line[rest + SENTINEL.len()..].trim();
+            let token = tail.split_whitespace().next().unwrap_or("");
+            if is_base58_pubkey(token) {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_base58_pubkey(s: &str) -> bool {
+    let len = s.chars().count();
+    if !(32..=44).contains(&len) {
+        return false;
+    }
+    s.chars().all(|c| {
+        matches!(
+            c,
+            '1'..='9'
+                | 'A'..='H'
+                | 'J'..='N'
+                | 'P'..='Z'
+                | 'a'..='k'
+                | 'm'..='z'
+        )
+    })
+}
+
+/// The node CLI's logger prepends every line with ANSI colour codes plus a
+/// human timestamp + level (`\x1b[90m01:50:27.568\x1b[0m  \x1b[32m\x1b[1mINFO\x1b[0m  message`).
+/// The UI already stamps its own timestamp and level onto every line, so the
+/// raw output ends up doubly-prefixed and full of unrendered escape codes.
+/// Strip both the colours and the CLI's own prefix — return the clean
+/// message and the canonical level detected from the prefix (falls back to
+/// the pipe name, e.g. "stdout" / "stderr").
+fn sanitise_log_line(raw: &str, default_level: &str) -> (String, String) {
+    let no_ansi = strip_ansi(raw);
+    let trimmed = no_ansi.trim_start();
+
+    // Expect `HH:MM:SS[.mmm]  LEVEL  <rest>` at the start. Regex-free scan.
+    let bytes = trimmed.as_bytes();
+    if let Some((rest, level)) = scan_timestamp_level(bytes) {
+        return (level.to_string(), rest.trim_start().to_string());
+    }
+    (default_level.to_string(), trimmed.to_string())
+}
+
+/// Remove every CSI escape sequence (`\x1b[...m` and related). No allocations
+/// beyond the output string; fast enough for log-rate input.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Drop ESC, then skip until we hit a terminator byte (@-~ range)
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(nc) = chars.next() {
+                    if (0x40..=0x7E).contains(&(nc as u32)) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Try to consume `HH:MM:SS(.mmm)?  LEVEL  ` from the start of `bytes`.
+/// Returns (rest_of_line, lowercased_level) on success.
+fn scan_timestamp_level(bytes: &[u8]) -> Option<(&str, String)> {
+    if bytes.len() < 10 {
+        return None;
+    }
+    let is_digit = |b: u8| b.is_ascii_digit();
+    if !(is_digit(bytes[0]) && is_digit(bytes[1]) && bytes[2] == b':'
+        && is_digit(bytes[3]) && is_digit(bytes[4]) && bytes[5] == b':'
+        && is_digit(bytes[6]) && is_digit(bytes[7]))
+    {
+        return None;
+    }
+    let mut cursor = 8;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        while cursor < bytes.len() && is_digit(bytes[cursor]) {
+            cursor += 1;
+        }
+    }
+    let ws_start = cursor;
+    while cursor < bytes.len() && (bytes[cursor] == b' ' || bytes[cursor] == b'\t') {
+        cursor += 1;
+    }
+    if cursor == ws_start {
+        return None;
+    }
+    let level_start = cursor;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
+        cursor += 1;
+    }
+    if cursor == level_start {
+        return None;
+    }
+    let level = std::str::from_utf8(&bytes[level_start..cursor]).ok()?;
+    if !matches!(level, "INFO" | "WARN" | "ERROR" | "DEBUG" | "TRACE" | "FATAL") {
+        return None;
+    }
+    while cursor < bytes.len() && (bytes[cursor] == b' ' || bytes[cursor] == b'\t') {
+        cursor += 1;
+    }
+    let rest = std::str::from_utf8(&bytes[cursor..]).ok()?;
+    Some((rest, level.to_lowercase()))
+}
+
+fn now_hhmmss() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let secs = secs % 60;
+    let millis = now.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, millis)
+}
