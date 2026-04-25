@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_updater::UpdaterExt;
 
 // Hard cap for quick, read-only CLI invocations (wallet-verify, config, etc).
 // 30 s is generous for a NestJS cold start but prevents an indefinite UI hang.
@@ -1196,4 +1197,42 @@ fn now_hhmmss() -> String {
     let secs = secs % 60;
     let millis = now.subsec_millis();
     format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, millis)
+}
+
+// ── Update checker ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    pub version: Option<String>,
+    pub body: Option<String>,
+}
+
+#[tauri::command]
+pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("Updater init failed: {}", e))?;
+
+    match updater.check().await {
+        Ok(Some(update)) => Ok(UpdateInfo {
+            available: true,
+            version: Some(update.version.clone()),
+            body: update.body.clone(),
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            version: None,
+            body: None,
+        }),
+        Err(e) => {
+            log::warn!("Update check failed: {}", e);
+            Ok(UpdateInfo {
+                available: false,
+                version: None,
+                body: None,
+            })
+        }
+    }
 }

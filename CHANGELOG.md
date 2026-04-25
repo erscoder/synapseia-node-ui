@@ -1,5 +1,18 @@
 # Changelog — node-ui
 
+## [0.2.0] 2026-04-25 — feat(version-gating): T7 Tauri auto-updater
+
+- Configured Tauri updater plugin: endpoints point to GitHub Releases
+  `latest.json`. Pubkey placeholder (needs `cargo tauri signer generate`).
+- New Rust command `check_for_updates`: uses `tauri-plugin-updater` to
+  query GitHub Releases for new versions.
+- New `useUpdateChecker` React hook: polls every 30 min, exposes
+  `installUpdate()` (download + relaunch) and `dismiss()`.
+- New `UpdateBanner.tsx`: emerald banner at top of dashboard, user-initiated
+  (click "Update & Restart"), not forced.
+- Added `@tauri-apps/plugin-process` for `relaunch()`.
+- Version bumped: package.json 0.2.0, tauri.conf.json 0.2.0, Cargo.toml 0.2.0.
+
 ## [2026-04-24] feat(node-ui): initial git import + security audit (493c6a6)
 
 Stack tracked: Tauri 2.10 + React 19.2 + Vite 7 + Tailwind 4.

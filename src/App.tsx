@@ -12,6 +12,8 @@ import { StakePanel } from "./components/StakePanel";
 import { SystemPanel } from "./components/SystemPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { LogViewer } from "./components/LogViewer";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { useUpdateChecker } from "./hooks/useUpdateChecker";
 
 export type Panel = "my-node" | "wallet" | "stake" | "system" | "settings" | "logs";
 
@@ -98,6 +100,7 @@ function App() {
   });
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [chainInfo, setChainInfo] = useState<ChainInfo | null>(null);
+  const update = useUpdateChecker();
 
   // Decide at boot whether we're creating a wallet or unlocking one.
   useEffect(() => {
@@ -264,6 +267,17 @@ function App() {
         nodeRunning={nodeStatus.running}
       />
       <main ref={mainRef} className="flex-1 overflow-auto p-6">
+        {update.available && (
+          <div className="mb-4">
+            <UpdateBanner
+              version={update.version}
+              installing={update.installing}
+              error={update.error}
+              onInstall={update.installUpdate}
+              onDismiss={update.dismiss}
+            />
+          </div>
+        )}
         {activePanel === "my-node" && (
           <MyNodePanel
             password={password}
