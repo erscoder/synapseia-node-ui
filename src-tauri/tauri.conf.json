@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.mainnet-beta.solana.com https://devnet.solana.com https://api.testnet.solana.com; img-src 'self' data: asset: https:"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.mainnet-beta.solana.com https://devnet.solana.com https://api.testnet.solana.com https://github.com https://objects.githubusercontent.com; img-src 'self' data: asset: https:"
     }
   },
   "bundle": {
