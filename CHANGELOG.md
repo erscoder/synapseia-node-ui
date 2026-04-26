@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-04-26] chore(node-ui): regenerate Cargo.lock after 0.4.0 version bump (e4e4e92)
+
+Lockfile didn't update during the 0.4.0 release commit; checked in to keep
+Tauri/Cargo state consistent with `src-tauri/tauri.conf.json`.
+
 ## [0.4.0] 2026-04-26 — version sync release
 
 - Bumped version to 0.4.0 (synced with coordinator and node).
