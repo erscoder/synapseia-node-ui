@@ -1,4 +1,12 @@
-# Changelog — node-ui
+# Changelog — @synapseia/node-ui
+
+## [0.4.0] 2026-04-26 — version sync release
+
+- Bumped version to 0.4.0 (synced with coordinator and node).
+- Renamed package from `tauri-app` to `@synapseia/node-ui`.
+- Updated Tauri updater endpoint to `erscoder/synapseia-node-ui`.
+- Updated Cargo.toml version to 0.4.0.
+- Added comprehensive README.
 
 ## [0.2.0] 2026-04-25 — feat(version-gating): T7 Tauri auto-updater
 

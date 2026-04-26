@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Synapseia Node",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "identifier": "network.synapseia.node-ui",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -56,7 +56,7 @@
     "updater": {
       "pubkey": "REPLACE_WITH_TAURI_SIGNING_PUBKEY",
       "endpoints": [
-        "https://github.com/synapseia/node/releases/latest/download/latest.json"
+        "https://github.com/erscoder/synapseia-node-ui/releases/latest/download/latest.json"
       ]
     },
     "shell": {
