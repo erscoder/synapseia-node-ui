@@ -18,6 +18,7 @@ export function WalletPanel({ password, status, chainInfo, onRefresh }: Props) {
   const [success, setSuccess] = useState<string | null>(null);
   const [destination, setDestination] = useState("");
   const [amount, setAmount] = useState("");
+  const [asset, setAsset] = useState<"sol" | "syn">("sol");
   const [showKey, setShowKey] = useState(false);
   const [exportedKey, setExportedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -39,7 +40,7 @@ export function WalletPanel({ password, status, chainInfo, onRefresh }: Props) {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleWithdrawSol = async () => {
+  const handleWithdraw = async () => {
     if (!password || !destination) {
       setError("Destination address required");
       return;
@@ -48,9 +49,10 @@ export function WalletPanel({ password, status, chainInfo, onRefresh }: Props) {
     setError(null);
     setSuccess(null);
     try {
+      const command = asset === "sol" ? "withdraw-sol" : "withdraw-syn";
       const args = amount ? [amount, destination] : [destination];
       const res = await invoke<CommandResult>("run_command", {
-        command: "withdraw-sol",
+        command,
         args,
         password,
       });
@@ -172,35 +174,122 @@ export function WalletPanel({ password, status, chainInfo, onRefresh }: Props) {
         />
       </div>
 
-      {/* Withdraw */}
-      <Card padding="md">
-        <div className="flex items-center gap-2 mb-4">
-          <ArrowUpCircle className="w-5 h-5 text-orange-400" />
-          <h2 className="text-lg font-semibold text-slate-100">Withdraw SOL</h2>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-          <Input
-            label="Destination address"
-            value={destination}
-            onChange={(e) => setDestination(e.target.value)}
-            placeholder="Solana address"
-          />
-          <Input
-            label="Amount (optional)"
-            type="number"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-            placeholder="Leave empty for all"
-          />
-        </div>
-        <Button
-          variant="danger"
-          onClick={handleWithdrawSol}
-          disabled={loading || !password || !destination}
-        >
-          {loading ? "Processing…" : "Withdraw"}
-        </Button>
-      </Card>
+      {/* Withdraw — pick asset, drag slider or type, hit Withdraw. */}
+      {(() => {
+        const sliderClass =
+          "w-full h-2 appearance-none rounded-full " +
+          "bg-[var(--bg-elevated)] accent-slate-500 " +
+          "disabled:opacity-40 cursor-pointer";
+        const availableMax =
+          asset === "sol" ? status.balance_sol ?? 0 : status.balance_syn ?? 0;
+        const symbol = asset === "sol" ? "SOL" : "SYN";
+        const accentClass = asset === "sol" ? "text-blue-400" : "text-violet-400";
+        const amountNum = Number.parseFloat(amount) || 0;
+        const exceedsMax = amountNum > availableMax;
+        const setAmountClamped = (raw: string) => {
+          if (raw === "") return setAmount("");
+          const n = Number.parseFloat(raw);
+          if (!Number.isFinite(n) || n < 0) return;
+          setAmount(String(Math.min(n, availableMax)));
+        };
+        return (
+          <Card padding="md">
+            <div className="flex items-center gap-2 mb-4">
+              <ArrowUpCircle className="w-5 h-5 text-orange-400" />
+              <h2 className="text-lg font-semibold text-slate-100">Withdraw</h2>
+            </div>
+
+            {/* Asset toggle */}
+            <div className="inline-flex p-1 rounded-xl bg-[var(--bg-elevated)] border border-white/[0.06] mb-5">
+              {(["sol", "syn"] as const).map((a) => {
+                const active = asset === a;
+                const activeColor =
+                  a === "sol" ? "bg-blue-500/15 text-blue-300" : "bg-violet-500/15 text-violet-300";
+                return (
+                  <button
+                    key={a}
+                    type="button"
+                    onClick={() => {
+                      setAsset(a);
+                      setAmount("");
+                    }}
+                    className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                      active ? activeColor : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    {a.toUpperCase()}
+                  </button>
+                );
+              })}
+            </div>
+
+            <Input
+              label="Destination address"
+              value={destination}
+              onChange={(e) => setDestination(e.target.value)}
+              placeholder="Solana address"
+            />
+
+            <div className="mt-5 space-y-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-400">
+                  Amount ({symbol})
+                </span>
+                <span className="text-slate-500">
+                  Available:{" "}
+                  <span className="text-slate-300 font-mono">
+                    {formatBalance(availableMax)}
+                  </span>{" "}
+                  <span className={accentClass}>{symbol}</span>
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={availableMax > 0 ? availableMax : 1}
+                step={Math.max(availableMax / 1000, 0.0001)}
+                value={amountNum}
+                onChange={(e) => setAmount(e.target.value)}
+                disabled={availableMax <= 0}
+                className={sliderClass}
+              />
+              <div className="flex items-stretch gap-2">
+                <div className="flex-1">
+                  <Input
+                    type="number"
+                    value={amount}
+                    onChange={(e) => setAmountClamped(e.target.value)}
+                    placeholder="0.0"
+                    error={exceedsMax ? `Exceeds available ${symbol}` : undefined}
+                  />
+                </div>
+                <Button
+                  variant="secondary"
+                  onClick={() => setAmount(String(availableMax))}
+                  disabled={availableMax <= 0}
+                >
+                  Max
+                </Button>
+              </div>
+            </div>
+
+            <Button
+              variant="danger"
+              onClick={handleWithdraw}
+              disabled={
+                loading ||
+                !password ||
+                !destination ||
+                exceedsMax ||
+                amountNum <= 0
+              }
+              className="mt-5"
+            >
+              {loading ? "Processing…" : `Withdraw ${symbol}`}
+            </Button>
+          </Card>
+        );
+      })()}
 
       {/* Export Key */}
       <Card padding="md">
