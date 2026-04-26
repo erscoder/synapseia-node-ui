@@ -38,6 +38,15 @@ function formatSyn(n: number): string {
   return n.toFixed(4);
 }
 
+// Mirrors WalletPanel.formatBalance: thousands separators always; decimals
+// dropped once the balance crosses 100k so the figure stays readable.
+function formatSynBalance(v: number | null): string {
+  if (v === null || !Number.isFinite(v)) return "—";
+  return v.toLocaleString(undefined, {
+    maximumFractionDigits: v >= 100_000 ? 0 : 4,
+  });
+}
+
 export function MyNodePanel({
   password,
   chainInfo,
@@ -151,27 +160,45 @@ export function MyNodePanel({
         }
       />
 
-      {/* Identity gets its own full-width row so the node name and the full
-          wallet address can breathe without fighting the 5-col grid. Below
-          it, the four stats share a clean 4-col grid (2-col on mobile). */}
-      <Card padding="md">
-        <div className="flex items-center gap-4 flex-wrap">
-          <div className="w-12 h-12 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center shrink-0">
-            <Monitor className="w-6 h-6 text-indigo-400" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-baseline gap-3 flex-wrap">
-              <h2 className="text-lg font-bold text-slate-100 truncate">{nodeName}</h2>
-              <span className="text-[10px] uppercase tracking-wider text-slate-500">
-                Node Identity
-              </span>
+      {/* Identity (3 cols) + SYN balance (1 col). On mobile they stack. */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="md:col-span-3">
+          <Card padding="md">
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="w-12 h-12 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center shrink-0">
+                <Monitor className="w-6 h-6 text-indigo-400" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-baseline gap-3 flex-wrap">
+                  <h2 className="text-lg font-bold text-slate-100 truncate">{nodeName}</h2>
+                  <span className="text-[10px] uppercase tracking-wider text-slate-500">
+                    Node Identity
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 font-mono break-all select-all mt-1">
+                  {wallet ?? "—"}
+                </p>
+              </div>
             </div>
-            <p className="text-xs text-slate-400 font-mono break-all select-all mt-1">
-              {wallet ?? "—"}
-            </p>
-          </div>
+          </Card>
         </div>
-      </Card>
+        <div className="md:col-span-1">
+          <Card padding="md">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-9 h-9 rounded-lg bg-violet-500/10 border border-violet-500/20 flex items-center justify-center shrink-0">
+                <Coins className="w-4 h-4 text-violet-400" />
+              </div>
+              <p className="text-[10px] uppercase tracking-wider text-slate-500">
+                SYN Balance
+              </p>
+            </div>
+            <p className="text-2xl font-bold text-slate-100 font-mono truncate" title={String(status.balance_syn ?? 0)}>
+              {formatSynBalance(status.balance_syn ?? null)}
+              <span className="ml-1 text-sm font-medium text-violet-400">SYN</span>
+            </p>
+          </Card>
+        </div>
+      </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard

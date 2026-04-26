@@ -102,8 +102,12 @@ export function WalletPanel({ password, status, chainInfo, onRefresh }: Props) {
     }
   };
 
+  // Drop decimals once the balance crosses 100k — keeps large figures
+  // readable while preserving precision on small ones.
   const formatBalance = (v: number | null) =>
-    v === null ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: 4 });
+    v === null
+      ? "—"
+      : v.toLocaleString(undefined, { maximumFractionDigits: v >= 100_000 ? 0 : 4 });
 
   return (
     <div className="space-y-6">
