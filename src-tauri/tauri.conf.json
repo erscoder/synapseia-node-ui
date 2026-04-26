@@ -54,7 +54,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "REPLACE_WITH_TAURI_SIGNING_PUBKEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERFRjhBMzY3QUUxNzQ3RkMKUldUOFJ4ZXVaNlA0M3BrVVhPTHFQM3pFRXFDQ01Wd1hjU29GYnNleW0zVnB3ejl1cm1LRURqbnEK",
       "endpoints": [
         "https://github.com/erscoder/synapseia-node-ui/releases/latest/download/latest.json"
       ]
