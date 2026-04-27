@@ -1,5 +1,24 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-04-27] fix(tauri): inject AGENT_BRAIN_PATH=<appDataDir>/agent-brain.json on start_node (1fb0484)
+
+Tauri spawns the node child with `cwd='/'`. Without an explicit
+`AGENT_BRAIN_PATH` env, the node had to guess a writable location relative
+to its install dir. Pinning the brain to Tauri's per-OS app data dir is
+the canonical fix; the node-side `__dirname`-based fallback (node/4f27eaff)
+is the safety net for non-Tauri spawns.
+
+Resolves the runtime error `Failed to save brain to /data/agent-brain.json:
+ENOENT: no such file or directory, mkdir '/data'`.
+
+- macOS:   `~/Library/Application Support/network.synapseia.node-ui/`
+- Linux:   `~/.local/share/network.synapseia.node-ui/`
+- Windows: `%APPDATA%\network.synapseia.node-ui\`
+
+Adds `tauri::Manager` to the imports so `app.path().app_data_dir()`
+resolves. Logs a stderr warning and lets the node fall back to its
+moduleDir-relative resolver if `create_dir_all` fails.
+
 ## [2026-04-26] chore(node-ui): regenerate Cargo.lock after 0.4.0 version bump (e4e4e92)
 
 Lockfile didn't update during the 0.4.0 release commit; checked in to keep
