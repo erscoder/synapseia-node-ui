@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 
 // Hard cap for quick, read-only CLI invocations (wallet-verify, config, etc).
@@ -682,6 +682,21 @@ pub async fn start_node(
         .env("NODE_ENV", "production")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Pin the agent-brain JSON to Tauri's per-OS app data dir so the node
+    // child (which inherits cwd='/') doesn't try to mkdir /data. This is
+    // the canonical fix; the node-side moduleDir-relative fallback in
+    // agent-brain.ts is the safety net for non-Tauri spawns.
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            eprintln!(
+                "[start_node] could not create app_data_dir {:?}: {} -- node will fall back to moduleDir-relative path",
+                data_dir, e
+            );
+        } else {
+            cmd.env("AGENT_BRAIN_PATH", data_dir.join("agent-brain.json"));
+        }
+    }
 
     let mut child = cmd
         .spawn()
