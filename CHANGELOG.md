@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-04-27] feat(logs-panel): stretch logs box to fill the full vertical viewport (89eb0ac)
+
+`LogViewer` used a static `h-[calc(100vh-200px)]` for the log box, leaving
+unused vertical space below it. Switched the panel to flex-col with
+`flex-1 min-h-0` on the scroll region so the box always fills whatever
+height the parent `<main>` exposes, regardless of viewport size or
+header changes. Header row gets `shrink-0` so it doesn't compete for
+space.
+
 ## [2026-04-27] fix(tauri): inject AGENT_BRAIN_PATH=<appDataDir>/agent-brain.json on start_node (1fb0484)
 
 Tauri spawns the node child with `cwd='/'`. Without an explicit
