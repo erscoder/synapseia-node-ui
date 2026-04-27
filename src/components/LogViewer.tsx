@@ -37,8 +37,8 @@ export function LogViewer({ logs }: Props) {
   };
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col h-full gap-4">
+      <div className="flex items-center justify-between shrink-0">
         <h1 className="text-2xl font-bold text-slate-100">Logs</h1>
         <div className="flex gap-2">
           <button
@@ -53,7 +53,7 @@ export function LogViewer({ logs }: Props) {
 
       <div
         ref={containerRef}
-        className="bg-[var(--bg-surface)] rounded-xl border border-[var(--bg-elevated)] p-4 h-[calc(100vh-200px)] overflow-y-auto font-mono text-sm"
+        className="bg-[var(--bg-surface)] rounded-xl border border-[var(--bg-elevated)] p-4 flex-1 min-h-0 overflow-y-auto font-mono text-sm"
       >
         {logs.length === 0 ? (
           <div className="flex items-center justify-center h-full text-slate-500">
