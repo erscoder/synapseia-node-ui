@@ -28,6 +28,7 @@ const TYPE_LABELS: Record<string, { label: string; color: string }> = {
   diloco: { label: "DiLoCo", color: "text-orange-400" },
   staking: { label: "Staking", color: "text-emerald-400" },
   work_order: { label: "Work Orders", color: "text-blue-400" },
+  docking: { label: "Molecular Docking", color: "text-fuchsia-400" },
 };
 
 function formatSyn(n: number): string {

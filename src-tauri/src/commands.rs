@@ -1251,3 +1251,66 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
         }
     }
 }
+
+// ── Molecular docking capability check ────────────────────────────────────
+
+/// Whether the local machine has AutoDock Vina + Open Babel installed.
+/// Surfaced in the desktop UI so users see WHY their node isn't picking
+/// up MOLECULAR_DOCKING work orders, instead of silently being skipped.
+/// Non-blocking — a missing binary just disables that workload type;
+/// every other workload (research, training, inference) keeps working.
+#[derive(Debug, serde::Serialize)]
+pub struct DockingCapabilities {
+    pub vina_available: bool,
+    pub vina_path: Option<String>,
+    pub vina_version: Option<String>,
+    pub obabel_available: bool,
+    pub obabel_path: Option<String>,
+    pub obabel_version: Option<String>,
+}
+
+#[tauri::command]
+pub async fn docking_capabilities() -> Result<DockingCapabilities, String> {
+    use std::process::Command;
+
+    let vina_path = which_in_path("vina");
+    let vina_version = vina_path.as_ref().and_then(|p| {
+        Command::new(p)
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if stdout.is_empty() { None } else { Some(stdout) }
+                } else { None }
+            })
+    });
+
+    let obabel_path = which_in_path("obabel");
+    let obabel_version = obabel_path.as_ref().and_then(|p| {
+        Command::new(p)
+            .arg("-V")
+            .output()
+            .ok()
+            .and_then(|o| {
+                // obabel writes the banner to stderr.
+                let raw = if !o.stderr.is_empty() {
+                    String::from_utf8_lossy(&o.stderr)
+                } else {
+                    String::from_utf8_lossy(&o.stdout)
+                };
+                let trimmed = raw.lines().next().unwrap_or("").trim().to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            })
+    });
+
+    Ok(DockingCapabilities {
+        vina_available: vina_path.is_some(),
+        vina_path: vina_path.as_ref().map(|p| p.display().to_string()),
+        vina_version,
+        obabel_available: obabel_path.is_some(),
+        obabel_path: obabel_path.as_ref().map(|p| p.display().to_string()),
+        obabel_version,
+    })
+}
