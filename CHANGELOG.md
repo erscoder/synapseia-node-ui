@@ -1,5 +1,26 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-04-29] feat(docking): Tauri capability check + reward type label (cb6a6b0)
+
+Layer 1 task 6/12 of the 4-layer pharma plan
+(`~/.claude/plans/lucky-mixing-dongarra.md`) — desktop UI surface for
+the MOLECULAR_DOCKING workload.
+
+- New Tauri `docking_capabilities()` async command. Probes for
+  `vina` + `obabel` on the augmented PATH (re-uses the existing
+  `which_in_path` helper) and runs each with `--version`/`-V` to
+  report the resolved version. Returns
+  `{ vina_available, vina_path, vina_version, obabel_available,
+  obabel_path, obabel_version }`. Frontend can call it once on
+  mount to surface a banner / disabled-toggle for users whose
+  machines lack the docking binaries — non-blocking, every other
+  workload keeps working.
+- New `docking` entry in `MyNodePanel`'s `TYPE_LABELS`
+  (fuchsia accent) so the rewards-by-type breakdown renders
+  `RewardType.DOCKING` rows correctly.
+
+`cargo check` clean. `vite build` clean.
+
 ## [2026-04-27] feat(logs-panel): stretch logs box to fill the full vertical viewport (89eb0ac)
 
 `LogViewer` used a static `h-[calc(100vh-200px)]` for the log box, leaving
