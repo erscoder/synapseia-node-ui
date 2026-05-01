@@ -1,5 +1,33 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-02] release: v1.0.0 — public-network milestone
+
+First stable release of the Synapseia Node desktop UI (Tauri 2 + React).
+
+What "1.0.0" means in this codebase:
+
+- **Tauri 2 shell stabilised** — capability/permission map locked to
+  the minimum required for node operation (Solana wallet, file
+  access for model cache, local node IPC). No broad APIs.
+- **Bundled Synapseia node runtime** — the desktop app drives the
+  same `@synapseia/node` 1.0.0 binary, so capabilities and protocol
+  match the headless release.
+- **Wallet panel + activation flow** — unlock → activation →
+  stake/tier visualisation hardened (see 2026-04-23 fixes).
+- **Dark theme, Liquid Glass-inspired surfaces** consistent with the
+  dashboard.
+
+Limits acknowledged for 1.0.0:
+
+- macOS + Linux signed builds are the reference target. Windows
+  builds compile but are unsigned for now.
+- Auto-update relies on the GitHub release feed of the node
+  sub-repo; in-app rollback is post-1.x.
+
+Version sync: matches `@synapseia/coordinator` 1.0.0 and
+`@synapseia/node` 1.0.0. Cargo crate `synapseia-node-ui` and the
+Tauri config are pinned to the same `1.0.0`.
+
 ## [2026-04-29] feat(docking): Tauri capability check + reward type label (cb6a6b0)
 
 Layer 1 task 6/12 of the 4-layer pharma plan
