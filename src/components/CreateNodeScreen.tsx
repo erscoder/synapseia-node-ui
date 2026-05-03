@@ -1,6 +1,13 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input } from "./ui";
+import {
+  CLOUD_PROVIDERS_UI,
+  OLLAMA_DEFAULT_MODELS,
+  buildSlug,
+  type CloudProviderId,
+  type ModelTier,
+} from "../lib/providers";
 
 interface Props {
   onCreated: (password: string, walletAddress: string) => void;
@@ -13,30 +20,36 @@ interface CreateResult {
   error_message: string | null;
 }
 
-const POPULAR_MODELS = [
-  { id: "openai/gpt-4o", name: "OpenAI GPT-4o" },
-  { id: "anthropic/claude-3-5-sonnet", name: "Anthropic Claude-3.5 Sonnet" },
-  { id: "google/gemini-1.5-pro", name: "Google Gemini-1.5 Pro" },
-  { id: "minimax/abab6-chat", name: "Minimax" },
-  { id: "ollama/llama3", name: "Ollama Llama3 (local)" },
-  { id: "ollama/qwen2.5", name: "Ollama Qwen2.5 (local)" },
-  { id: "custom", name: "Custom…" },
-];
+type ProviderSelection =
+  | { kind: "cloud"; provider: CloudProviderId; tier: ModelTier }
+  | { kind: "ollama"; modelId: string };
+
+const DEFAULT_SELECTION: ProviderSelection = {
+  kind: "cloud",
+  provider: "anthropic",
+  tier: "mid",
+};
+
+function slugFromSelection(sel: ProviderSelection): string {
+  if (sel.kind === "ollama") return buildSlug("ollama", sel.modelId);
+  const entry = CLOUD_PROVIDERS_UI.find(p => p.id === sel.provider);
+  if (!entry) return "anthropic/claude-sonnet-4-6";
+  return buildSlug(entry.id, entry.models[sel.tier].modelId);
+}
 
 export function CreateNodeScreen({ onCreated }: Props) {
   const [nodeName, setNodeName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [coordinatorUrl, setCoordinatorUrl] = useState("http://localhost:3701");
-  const [selectedModel, setSelectedModel] = useState("openai/gpt-4o");
-  const [customModel, setCustomModel] = useState("");
-  const [llmUrl, setLlmUrl] = useState("");
+  const [selection, setSelection] = useState<ProviderSelection>(DEFAULT_SELECTION);
   const [llmKey, setLlmKey] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const isLocalModel = selectedModel.startsWith("ollama/");
-  const needsCredentials = !isLocalModel && selectedModel !== "custom";
+  const isLocalModel = selection.kind === "ollama";
+  // Ollama needs no key; cloud always needs one to do anything useful.
+  const needsCredentials = !isLocalModel;
 
   const handleCreate = async () => {
     setError(null);
@@ -48,8 +61,7 @@ export function CreateNodeScreen({ onCreated }: Props) {
       return setError("Coordinator URL must start with http:// or https://.");
     }
 
-    const modelToSave = selectedModel === "custom" ? customModel.trim() : selectedModel;
-    if (!modelToSave) return setError("Please select or enter a model.");
+    const modelToSave = slugFromSelection(selection);
 
     setLoading(true);
     try {
@@ -58,7 +70,11 @@ export function CreateNodeScreen({ onCreated }: Props) {
         nodeName: nodeName.trim(),
         coordinatorUrl: coordinatorUrl.trim(),
         model: modelToSave,
-        llmUrl: needsCredentials ? llmUrl.trim() : null,
+        // llmUrl is no longer used (endpoints are hardcoded per provider).
+        // We keep the parameter on the IPC call for one release so older
+        // Tauri builds receive a defined value; the node-side `wallet-create`
+        // command logs a deprecation WARN and ignores it.
+        llmUrl: null,
         llmKey: needsCredentials ? llmKey.trim() : null,
       });
 
@@ -73,6 +89,17 @@ export function CreateNodeScreen({ onCreated }: Props) {
       setError(e instanceof Error ? e.message : String(e));
       setLoading(false);
     }
+  };
+
+  const providerSelectValue = selection.kind === "ollama" ? "ollama" : selection.provider;
+  const onProviderChange = (next: string) => {
+    if (next === "ollama") {
+      setSelection({ kind: "ollama", modelId: OLLAMA_DEFAULT_MODELS[0].modelId });
+      return;
+    }
+    const entry = CLOUD_PROVIDERS_UI.find(p => p.id === next);
+    if (!entry) return;
+    setSelection({ kind: "cloud", provider: entry.id, tier: "mid" });
   };
 
   return (
@@ -130,49 +157,72 @@ export function CreateNodeScreen({ onCreated }: Props) {
             disabled={loading}
           />
 
-          <div className="space-y-1.5">
-            <label className="block text-xs uppercase tracking-wide text-slate-400">Default Model</label>
-            <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              disabled={loading}
-              className="w-full px-4 py-2.5 bg-[var(--bg-elevated)]/80 backdrop-blur-sm border border-white/[0.06] rounded-lg text-slate-100 focus:outline-none focus:border-[var(--accent-cyan)]/60 focus:ring-2 focus:ring-[var(--accent-cyan)]/20 disabled:opacity-60 transition-all"
-            >
-              {POPULAR_MODELS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
-            </select>
-            {selectedModel === "custom" && (
-              <Input
-                value={customModel}
-                onChange={(e) => setCustomModel(e.target.value)}
-                placeholder="e.g. openai/gpt-4o"
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className="block text-xs uppercase tracking-wide text-slate-400">Provider</label>
+              <select
+                value={providerSelectValue}
+                onChange={(e) => onProviderChange(e.target.value)}
                 disabled={loading}
-                className="mt-2"
-              />
-            )}
+                className="w-full px-4 py-2.5 bg-[var(--bg-elevated)]/80 backdrop-blur-sm border border-white/[0.06] rounded-lg text-slate-100 focus:outline-none focus:border-[var(--accent-cyan)]/60 focus:ring-2 focus:ring-[var(--accent-cyan)]/20 disabled:opacity-60 transition-all"
+              >
+                <option value="ollama">Ollama (local)</option>
+                {CLOUD_PROVIDERS_UI.map((p) => (
+                  <option key={p.id} value={p.id}>{p.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="block text-xs uppercase tracking-wide text-slate-400">
+                {selection.kind === "ollama" ? "Local model" : "Tier"}
+              </label>
+              {selection.kind === "ollama" ? (
+                <select
+                  value={selection.modelId}
+                  onChange={(e) => setSelection({ kind: "ollama", modelId: e.target.value })}
+                  disabled={loading}
+                  className="w-full px-4 py-2.5 bg-[var(--bg-elevated)]/80 backdrop-blur-sm border border-white/[0.06] rounded-lg text-slate-100 focus:outline-none focus:border-[var(--accent-cyan)]/60 focus:ring-2 focus:ring-[var(--accent-cyan)]/20 disabled:opacity-60 transition-all"
+                >
+                  {OLLAMA_DEFAULT_MODELS.map((m) => (
+                    <option key={m.modelId} value={m.modelId}>
+                      {m.modelId}{m.hint ? ` — ${m.hint}` : ""}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <select
+                  value={selection.tier}
+                  onChange={(e) =>
+                    setSelection({ kind: "cloud", provider: selection.provider, tier: e.target.value as ModelTier })
+                  }
+                  disabled={loading}
+                  className="w-full px-4 py-2.5 bg-[var(--bg-elevated)]/80 backdrop-blur-sm border border-white/[0.06] rounded-lg text-slate-100 focus:outline-none focus:border-[var(--accent-cyan)]/60 focus:ring-2 focus:ring-[var(--accent-cyan)]/20 disabled:opacity-60 transition-all"
+                >
+                  {(["top", "mid", "budget"] as const).map((tier) => {
+                    const entry = CLOUD_PROVIDERS_UI.find(p => p.id === selection.provider)!;
+                    const desc = entry.models[tier];
+                    const tierLabel = tier === "top" ? "Top" : tier === "mid" ? "Mid" : "Budget";
+                    return (
+                      <option key={tier} value={tier}>
+                        {tierLabel} — {desc.modelId}{desc.hint ? ` (${desc.hint})` : ""}
+                      </option>
+                    );
+                  })}
+                </select>
+              )}
+            </div>
           </div>
 
           {needsCredentials && (
-            <>
-              <Input
-                label="LLM API URL"
-                value={llmUrl}
-                onChange={(e) => setLlmUrl(e.target.value)}
-                placeholder="https://api.openai.com/v1"
-                disabled={loading}
-              />
-              <Input
-                label="LLM API Key"
-                type="password"
-                value={llmKey}
-                onChange={(e) => setLlmKey(e.target.value)}
-                placeholder="sk-..."
-                disabled={loading}
-              />
-            </>
+            <Input
+              label="LLM API Key"
+              type="password"
+              value={llmKey}
+              onChange={(e) => setLlmKey(e.target.value)}
+              placeholder="sk-..."
+              disabled={loading}
+              hint={`Or set env var ${CLOUD_PROVIDERS_UI.find(p => selection.kind === "cloud" && p.id === selection.provider)?.apiKeyEnvVar ?? ""}`}
+            />
           )}
 
           {error && (
