@@ -1,5 +1,26 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-03] feat(node-ui): provider+tier dropdowns, drop Custom… and LLM URL field (cf307c2)
+
+Replaced the flat `POPULAR_MODELS` list with two coupled dropdowns:
+**Provider** (OpenAI, Anthropic, Google, Kimi, MiniMax, Zhipu, Ollama)
+and **Tier** (Top / Mid / Budget) — three models per cloud provider.
+The `Custom…` option and the free-form `LLM API URL` input are gone:
+every cloud endpoint is hardcoded by the node so the wire-protocol
+adapter can rely on a known response shape.
+
+The provider list lives in `src/lib/providers.ts` (mirror of the
+node's authoritative table). Both `SettingsPanel.tsx` and
+`CreateNodeScreen.tsx` consume it. The Tauri IPC `create_wallet` call
+still receives an `llmUrl` parameter for one release (set to `null`)
+so older Rust shells keep working — the node CLI logs a deprecation
+WARN and ignores the value.
+
+API-key field tooltip now lists the env var the operator can set per
+provider (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
+MOONSHOT_API_KEY, MINIMAX_API_KEY, ZHIPU_API_KEY) instead of asking
+for a generic OpenAI-style endpoint URL.
+
 ## [2026-05-02] release: v1.0.0 — public-network milestone
 
 First stable release of the Synapseia Node desktop UI (Tauri 2 + React).
