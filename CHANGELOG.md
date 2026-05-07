@@ -1,5 +1,24 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-07] chore(release): version sync 0.6.0/0.8.0 → 0.8.1
+
+Beta-launch slice S6. Synced version across all three sources of
+truth (sub `feedback_version_sync.md` rule):
+
+- `package.json`: `0.8.0` → `0.8.1`.
+- `src-tauri/Cargo.toml`: `0.6.0` → `0.8.1` (was drifted from prior
+  Sprint 11+12 bump).
+- `src-tauri/tauri.conf.json`: `0.6.0` → `0.8.1` (same drift).
+
+Aligns node-ui with `@synapseia/coordinator@0.8.1` and
+`@synapseia/node@0.8.1` (S5). Tagging `node-ui-v0.8.1` in this sub-repo
+triggers `.github/workflows/release-node-ui.yml` 4-job matrix
+(macOS arm64 + macOS x64 + Linux + Windows) and publishes the GitHub
+Release with `.dmg`, `.msi`, `.AppImage` artifacts.
+
+Tag push is operator-driven — see commit message for the exact
+command.
+
 ## [2026-05-07] feat(beta): pre-flight capacity probe + BetaLimitModal
 
 Closed devnet beta launch — slice S3.
