@@ -328,6 +328,63 @@ pub async fn fetch_chain_info() -> Result<ChainInfo, String> {
     ))
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CapacityResponse {
+    pub limit: u64,
+    pub current: u64,
+    pub accepting: bool,
+}
+
+/// Read the coordinator URL from the wallet's saved config. The CLI
+/// `wallet-create` command persists `coordinatorUrl` into
+/// `~/.synapseia/config.json`; mirroring that lookup here lets the
+/// frontend pre-flight the beta capacity gate without needing to thread
+/// the URL through React state.
+fn read_coordinator_url() -> Result<String, String> {
+    let config_path = synapseia_home().join("config.json");
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("failed to read {}: {}", config_path.display(), e))?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid config json: {}", e))?;
+    let url = json
+        .get("coordinatorUrl")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "coordinatorUrl missing in config.json".to_string())?
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return Err("coordinatorUrl is empty in config.json".to_string());
+    }
+    Ok(url)
+}
+
+/// Pre-flight the closed-beta capacity gate by hitting the coordinator's
+/// public `GET /peer/capacity` endpoint. Returns the full payload so the
+/// frontend can show "X / Y nodes registered" alongside the
+/// limit-reached modal. Network failures bubble up as `Err`; the caller
+/// is expected to fall through to the normal `start_node` path on error
+/// rather than show a false-positive beta-limit modal.
+#[tauri::command]
+pub async fn check_capacity() -> Result<CapacityResponse, String> {
+    let coordinator_url = read_coordinator_url()?;
+    let url = format!("{}/peer/capacity", coordinator_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("network error: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("coord returned status {}", response.status()));
+    }
+
+    response
+        .json::<CapacityResponse>()
+        .await
+        .map_err(|e| format!("invalid capacity response: {}", e))
+}
+
 /// Report whether a Synapseia node is running *outside* this Tauri process.
 /// We read ~/.synapseia/node.lock (written by the CLI `start` command or by
 /// our own start_node) and, if the PID is still alive, return it — but ONLY

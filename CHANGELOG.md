@@ -1,5 +1,40 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-07] feat(beta): pre-flight capacity probe + BetaLimitModal
+
+Closed devnet beta launch — slice S3.
+
+**Rust side**
+
+- `src-tauri/Cargo.toml`: add `reqwest` (rustls-tls + json, no
+  default features) for the lightweight capacity probe.
+- `src-tauri/src/commands.rs`: new `check_capacity` Tauri command.
+  Reads `coordinatorUrl` from `~/.synapseia/config.json`, hits
+  `GET <coord>/peer/capacity` (5 s timeout), returns
+  `{ limit, current, accepting }`. Network/HTTP errors bubble up
+  as `Err` so the frontend can fall through to the existing
+  `start_node` path instead of showing a false-positive modal.
+- `src-tauri/src/lib.rs`: register `check_capacity` in the
+  `invoke_handler!` macro.
+
+**React side**
+
+- `src/components/BetaLimitModal.tsx` (new): full-screen overlay
+  mirroring `ActivationScreen` (Tailwind only, `Card` + `Button`
+  primitives, `lucide-react` icon). Backdrop click / ESC / Enter /
+  OK button all close. OK button autofocused. Renders
+  `{current} / {limit} nodes registered` only when both numbers
+  are known (zero on the fallback path).
+- `src/App.tsx`: `handleStartNode` pre-flights the capacity probe.
+  When `accepting === false` it shows the modal and never spawns
+  the CLI. The `node-log` listener also matches
+  `/^\[BETA_LIMIT_REACHED\]/` against the message field —
+  catches the race where the cap fills between the probe and the
+  CLI's first heartbeat (CLI emits the marker per slice S2). Modal
+  is rendered both on the unlocked dashboard and on the activation
+  screen so a marker firing during the post-activation auto-start
+  is still visible.
+
 ## [2026-05-03] feat(node-ui): provider+tier dropdowns, drop Custom… and LLM URL field (cf307c2)
 
 Replaced the flat `POPULAR_MODELS` list with two coupled dropdowns:

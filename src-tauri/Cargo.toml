@@ -27,3 +27,4 @@ tokio = { version = "1", features = ["process", "io-util", "sync", "rt"] }
 log = "0.4"
 dirs = "5"
 sysinfo = "0.33"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

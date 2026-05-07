@@ -1,9 +1,9 @@
 mod commands;
 
 use commands::{
-    check_for_updates, create_wallet, docking_capabilities, external_node_info, fetch_chain_info,
-    get_node_logs, node_status, reap_on_exit, run_command, start_node, stop_node, system_info,
-    unlock_wallet, wallet_exists, NodeProcess, NodeProcessState,
+    check_capacity, check_for_updates, create_wallet, docking_capabilities, external_node_info,
+    fetch_chain_info, get_node_logs, node_status, reap_on_exit, run_command, start_node, stop_node,
+    system_info, unlock_wallet, wallet_exists, NodeProcess, NodeProcessState,
 };
 
 use std::sync::Arc;
@@ -43,6 +43,7 @@ pub fn run() {
             system_info,
             check_for_updates,
             docking_capabilities,
+            check_capacity,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

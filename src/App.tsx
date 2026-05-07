@@ -13,6 +13,7 @@ import { SystemPanel } from "./components/SystemPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { LogViewer } from "./components/LogViewer";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { BetaLimitModal } from "./components/BetaLimitModal";
 import { useUpdateChecker } from "./hooks/useUpdateChecker";
 
 export type Panel = "my-node" | "wallet" | "stake" | "system" | "settings" | "logs";
@@ -44,6 +45,12 @@ interface WalletExistsResult {
   exists: boolean;
   wallet_path: string;
   config_exists: boolean;
+}
+
+export interface CapacityResponse {
+  limit: number;
+  current: number;
+  accepting: boolean;
 }
 
 export interface ChainInfo {
@@ -100,6 +107,14 @@ function App() {
   });
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [chainInfo, setChainInfo] = useState<ChainInfo | null>(null);
+  // Closed-beta capacity gate. `limit`/`current` are 0 when the modal
+  // was opened by the stdout-marker fallback (the CLI doesn't echo
+  // numbers, only the marker line).
+  const [betaLimitModal, setBetaLimitModal] = useState<{
+    open: boolean;
+    limit: number;
+    current: number;
+  }>({ open: false, limit: 0, current: 0 });
   const update = useUpdateChecker();
 
   // Decide at boot whether we're creating a wallet or unlocking one.
@@ -121,6 +136,15 @@ function App() {
         const next = [...prev, event.payload];
         return next.slice(-2000);
       });
+      // Beta-limit fallback: catches the race window between the
+      // pre-flight `check_capacity` probe and the CLI's first
+      // heartbeat. The node CLI emits this marker (slice S2) when the
+      // coordinator rejects with HTTP 403 + BETA_LIMIT_REACHED. No
+      // parsed numbers — just the marker.
+      const msg = event.payload?.message ?? "";
+      if (/^\[BETA_LIMIT_REACHED\]/.test(msg)) {
+        setBetaLimitModal({ open: true, limit: 0, current: 0 });
+      }
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -212,6 +236,24 @@ function App() {
 
   const handleStartNode = useCallback(async () => {
     if (!password) return;
+    // Pre-flight capacity probe. We hit the coordinator's public
+    // `/peer/capacity` endpoint BEFORE spawning the CLI; on a
+    // closed-beta full house we surface the modal instantly without
+    // the multi-second cold-start of the node binary. Network errors
+    // are NOT treated as a beta-limit signal — false positives are
+    // worse than the small race window we have anyway. Errors fall
+    // through to `start_node`, which surfaces them through the
+    // existing error path / log viewer.
+    try {
+      const cap = await invoke<CapacityResponse>("check_capacity");
+      if (!cap.accepting) {
+        setBetaLimitModal({ open: true, limit: cap.limit, current: cap.current });
+        return;
+      }
+    } catch (err) {
+      console.warn("check_capacity failed; proceeding to start_node", err);
+    }
+
     try {
       const status = await invoke<NodeStatus>("start_node", { password });
       setNodeStatus(status);
@@ -248,19 +290,33 @@ function App() {
 
   if (bootPhase === "needs-activation" && walletAddress && password) {
     return (
-      <ActivationScreen
-        walletAddress={walletAddress}
-        password={password}
-        onActivated={() => {
-          setBootPhase("unlocked");
-          handleStartNode();
-        }}
-      />
+      <>
+        <BetaLimitModal
+          open={betaLimitModal.open}
+          limit={betaLimitModal.limit}
+          current={betaLimitModal.current}
+          onClose={() => setBetaLimitModal((s) => ({ ...s, open: false }))}
+        />
+        <ActivationScreen
+          walletAddress={walletAddress}
+          password={password}
+          onActivated={() => {
+            setBootPhase("unlocked");
+            handleStartNode();
+          }}
+        />
+      </>
     );
   }
 
   return (
     <div className="flex h-screen text-slate-100 font-mono">
+      <BetaLimitModal
+        open={betaLimitModal.open}
+        limit={betaLimitModal.limit}
+        current={betaLimitModal.current}
+        onClose={() => setBetaLimitModal((s) => ({ ...s, open: false }))}
+      />
       <Sidebar
         activePanel={activePanel}
         onPanelChange={setActivePanel}
