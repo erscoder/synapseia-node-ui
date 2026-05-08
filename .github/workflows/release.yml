@@ -72,6 +72,6 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Synapseia Node ${{ github.ref_name }}"
           releaseBody: "See the [CHANGELOG](https://github.com/erscoder/synapseia-node-ui/blob/main/CHANGELOG.md) for details."
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
