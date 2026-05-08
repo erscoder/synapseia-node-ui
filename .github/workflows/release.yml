@@ -43,7 +43,12 @@ jobs:
           node-version: 22
 
       - name: Install pnpm
-        run: npm install -g pnpm@latest
+        # Pin to v9: pnpm 10 added strict-build-scripts which rejects
+        # post-install scripts (esbuild, @tailwindcss/oxide) by default
+        # and ERR_PNPM_IGNORED_BUILDS exits 1 even with
+        # `pnpm.onlyBuiltDependencies` declared in package.json.
+        # Stay on v9 until we fully migrate to v10 config.
+        run: npm install -g pnpm@9
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
