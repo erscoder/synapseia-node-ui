@@ -41,7 +41,6 @@ export function CreateNodeScreen({ onCreated }: Props) {
   const [nodeName, setNodeName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [coordinatorUrl, setCoordinatorUrl] = useState("http://localhost:3701");
   const [selection, setSelection] = useState<ProviderSelection>(DEFAULT_SELECTION);
   const [llmKey, setLlmKey] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -57,9 +56,6 @@ export function CreateNodeScreen({ onCreated }: Props) {
     if (!nodeName.trim()) return setError("Node name is required.");
     if (password.length < 8) return setError("Password must be at least 8 characters.");
     if (password !== confirmPassword) return setError("Passwords do not match.");
-    if (!coordinatorUrl.startsWith("http://") && !coordinatorUrl.startsWith("https://")) {
-      return setError("Coordinator URL must start with http:// or https://.");
-    }
 
     const modelToSave = slugFromSelection(selection);
 
@@ -68,7 +64,6 @@ export function CreateNodeScreen({ onCreated }: Props) {
       const result = await invoke<CreateResult>("create_wallet", {
         password,
         nodeName: nodeName.trim(),
-        coordinatorUrl: coordinatorUrl.trim(),
         model: modelToSave,
         // llmUrl is no longer used (endpoints are hardcoded per provider).
         // We keep the parameter on the IPC call for one release so older
@@ -148,14 +143,6 @@ export function CreateNodeScreen({ onCreated }: Props) {
               onKeyDown={(e) => e.key === "Enter" && !loading && handleCreate()}
             />
           </div>
-
-          <Input
-            label="Coordinator URL"
-            value={coordinatorUrl}
-            onChange={(e) => setCoordinatorUrl(e.target.value)}
-            placeholder="http://localhost:3701"
-            disabled={loading}
-          />
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-1.5">

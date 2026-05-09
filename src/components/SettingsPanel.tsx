@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CommandResult } from "../App";
 import { Save, RotateCcw, Globe, Cpu, Key, Eye, EyeOff } from "lucide-react";
+// `Globe` is still used by the Inference Server card; the Coordinator URL
+// input that previously needed an icon is gone.
 import { Card, Button, PageHeader, Input } from "./ui";
 import {
   CLOUD_PROVIDERS_UI,
@@ -18,7 +20,6 @@ interface Props {
 
 interface ConfigState {
   name: string;
-  coordinatorUrl: string;
   defaultModel: string;
   llmKey: string;
   inferenceEnabled: boolean;
@@ -27,7 +28,6 @@ interface ConfigState {
 
 const DEFAULT_CONFIG: ConfigState = {
   name: "",
-  coordinatorUrl: "http://localhost:3701",
   defaultModel: "ollama/qwen2.5:0.5b",
   llmKey: "",
   inferenceEnabled: false,
@@ -124,7 +124,6 @@ export function SettingsPanel({ password }: Props) {
       setHasStoredKey(storedKey.length > 0);
       setConfig({
         name: (parsed.name as string) ?? "",
-        coordinatorUrl: (parsed.coordinatorUrl as string) ?? DEFAULT_CONFIG.coordinatorUrl,
         defaultModel: slug,
         llmKey: storedKey,
         inferenceEnabled: (parsed.inferenceEnabled as boolean) ?? false,
@@ -153,7 +152,6 @@ export function SettingsPanel({ password }: Props) {
       const modelToSave = slugFromSelection(selection);
       const updates: { flag: string; value: string }[] = [];
       if (config.name) updates.push({ flag: "--set-name", value: config.name });
-      if (config.coordinatorUrl) updates.push({ flag: "--set-coordinator-url", value: config.coordinatorUrl });
       if (modelToSave) updates.push({ flag: "--set-model", value: modelToSave });
       // Only push the key if the user actually typed something (not the
       // placeholder dots or the value we loaded back from disk).
@@ -281,22 +279,13 @@ export function SettingsPanel({ password }: Props) {
           <Cpu className="w-5 h-5 text-[var(--accent-cyan)]" />
           <h2 className="text-lg font-semibold text-slate-100">Node Identity</h2>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Input
-            label="Node Name"
-            value={config.name}
-            onChange={(e) => updateField("name", e.target.value)}
-            placeholder="My Synapseia Node"
-            hint="Visible to other peers in the network"
-          />
-          <Input
-            label="Coordinator URL"
-            value={config.coordinatorUrl}
-            onChange={(e) => updateField("coordinatorUrl", e.target.value)}
-            placeholder="http://localhost:3701"
-            hint="URL of the coordinator server"
-          />
-        </div>
+        <Input
+          label="Node Name"
+          value={config.name}
+          onChange={(e) => updateField("name", e.target.value)}
+          placeholder="My Synapseia Node"
+          hint="Visible to other peers in the network"
+        />
       </Card>
 
       <Card padding="md">
