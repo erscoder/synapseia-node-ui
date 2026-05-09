@@ -25,6 +25,16 @@ src-tauri/            Rust backend (Tauri 2)
   src/main.rs         Entry point
 ```
 
+## macOS: "damaged and can't be opened"
+
+The app is not yet code-signed with an Apple Developer ID. macOS Gatekeeper quarantines unsigned downloads and shows this error. To fix it, run this in Terminal after installing:
+
+```bash
+sudo xattr -cr "/Applications/Synapseia Node.app"
+```
+
+Then open the app normally.
+
 ## Prerequisites
 
 | Tool | Version |
