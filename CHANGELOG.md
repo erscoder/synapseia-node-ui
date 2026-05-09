@@ -1,5 +1,42 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-09] chore(config): drop coordinator URL knobs — env-var-only (4f7103c)
+
+UX simplification, mirrors `@synapseia/node@0.8.2`. The desktop UI no
+longer lets the user type a coordinator URL — operators that need a
+non-default coordinator launch the app with `COORDINATOR_URL=...`
+exported in their shell, and the spawned node CLI inherits that env
+var automatically.
+
+Frontend (React):
+
+- `CreateNodeScreen.tsx` — removed the "Coordinator URL" input, its
+  `useState`, the `http(s)://` validation, and the field from the
+  `create_wallet` Tauri invoke payload.
+- `SettingsPanel.tsx` — removed `coordinatorUrl` from `Config`,
+  `DEFAULT_CONFIG`, the JSON parse/merge block, the
+  `--set-coordinator-url` save flag, and the input + label that the
+  user typed into. The Node Identity card now contains only the
+  Node Name input.
+
+Tauri (Rust):
+
+- `commands.rs::create_wallet` — dropped the `coordinator_url: String`
+  parameter, the `INVALID_COORDINATOR` validation, and the
+  `--coordinator-url` arg from the spawned CLI subprocess. The child
+  process inherits the parent's env by default.
+- `commands.rs::read_coordinator_url` — no longer reads
+  `~/.synapseia/config.json`. Returns `COORDINATOR_URL` env var or the
+  hardcoded `https://api.synapseia.network` fallback. Lockstep with
+  `packages/node/src/constants/coordinator.ts`.
+
+No on-disk migration: existing `config.json` files keep their legacy
+`coordinatorUrl` value, the desktop UI just ignores it.
+
+Versions: `package.json`, `src-tauri/Cargo.toml`,
+`src-tauri/tauri.conf.json` all bumped `0.8.3` → `0.8.4` per the
+version-sync rule.
+
 ## [2026-05-07] chore(release): version sync 0.6.0/0.8.0 → 0.8.1
 
 Beta-launch slice S6. Synced version across all three sources of
