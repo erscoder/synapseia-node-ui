@@ -1,5 +1,13 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-09] chore(version): align to 0.8.5 with coord + node (c146628)
+
+Version-only bump 0.8.4 → 0.8.5 across `package.json`,
+`src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json` (and
+`Cargo.lock` regenerated). Brings the package back into lockstep
+with `coordinator` and `node` per the version-sync invariant. No
+code change.
+
 ## [2026-05-09] chore(config): drop coordinator URL knobs — env-var-only (4f7103c)
 
 UX simplification, mirrors `@synapseia/node@0.8.2`. The desktop UI no
