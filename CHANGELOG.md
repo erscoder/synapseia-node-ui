@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] fix(deps): @tauri-apps/api ^2.11 to match Cargo tauri 2.11 (d20ca3e)
+
+The 0.8.6 release CI failed with the Tauri version-mismatch
+guard: `tauri (v2.11.1) : @tauri-apps/api (v2.10.1)`. Bumped
+the npm side to `^2.11` so pnpm resolves matching major.minor.
+Folded into the 0.8.6 tag (force-retagged `node-ui-v0.8.6` at
+this commit; no release was published yet so no upstream
+artifact churn).
+
 ## [2026-05-10] chore(security): tauri 2.11 + locator hardening + version 0.8.5 → 0.8.6 (d670a8f)
 
 Closes Tauri GHSA-7gmj-67g7-phm9 (CVSS 6.1) by bumping
