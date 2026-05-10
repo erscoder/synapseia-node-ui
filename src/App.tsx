@@ -126,8 +126,24 @@ function App() {
   const update = useUpdateChecker();
 
   // Decide at boot whether we're creating a wallet or unlocking one.
+  // Step 1 ensures the @synapseia-network/node CLI is on disk BEFORE the
+  // wallet branch — `install_synapseia_node` is idempotent (early-returns
+  // with an `already-installed` event when present), so the spinner is a
+  // sub-100ms flash on the common path. If install fails we fall through
+  // to `checking` and rely on handleStartNode's ERR_CLI_MISSING fallback.
   useEffect(() => {
     (async () => {
+      try {
+        setBootPhase("installing-node");
+        setInstallProgress("Checking @synapseia-network/node CLI…");
+        await invoke<string>("install_synapseia_node");
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setInstallError(msg);
+        setBootPhase("checking");
+        return;
+      }
+
       try {
         const info = await invoke<WalletExistsResult>("wallet_exists");
         setBootPhase(info.exists ? "needs-unlock" : "needs-create");
@@ -331,9 +347,16 @@ function App() {
               <p className="font-semibold mb-1">Installation failed</p>
               <p>{installError}</p>
               <button
-                onClick={() => {
+                onClick={async () => {
                   setInstallError(null);
-                  setBootPhase("unlocked");
+                  setBootPhase("checking");
+                  try {
+                    const info = await invoke<WalletExistsResult>("wallet_exists");
+                    setBootPhase(info.exists ? "needs-unlock" : "needs-create");
+                  } catch (e) {
+                    setBootError(e instanceof Error ? e.message : String(e));
+                    setBootPhase("needs-create");
+                  }
                 }}
                 className="mt-3 rounded bg-slate-700 px-3 py-1 text-xs text-slate-100 hover:bg-slate-600"
               >
