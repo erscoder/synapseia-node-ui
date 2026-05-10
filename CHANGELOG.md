@@ -1,5 +1,28 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] fix(autoinstall): legacy bin collision + non-fatal boot install (2a5307b)
+
+Two follow-ups to the 0.8.7 boot-time auto-install:
+
+- **Bin collision (EEXIST)**: users who had the legacy
+  `@synapseia/node` (pre-rename) installed globally hit
+  `EEXIST: file already exists - .../bin/syn` because the new
+  package declares `synapseia` + `syn` bins on top of the old
+  package's bins. The Tauri command now does a best-effort
+  `npm uninstall -g @synapseia/node` first (errors ignored — the
+  most common case is "package not installed") and passes
+  `--force` to `npm install -g @synapseia-network/node` so an
+  EEXIST on the bin overlap doesn't strand the install.
+- **Non-fatal boot install**: when `install_synapseia_node` errored
+  during the boot useEffect the `return` short-circuited
+  `wallet_exists`, leaving the user stuck on "Checking wallet…"
+  with the install error invisible. Drop the early return — the
+  wallet check now runs unconditionally and the
+  `handleStartNode` ERR_CLI_MISSING fallback covers the retry on
+  Start.
+
+Version bumped to 0.8.8 (sync with coord + node).
+
 ## [2026-05-10] fix(autoinstall): run install_synapseia_node at boot, not just on Start (fad89a8)
 
 Existing-wallet users were hitting `ERR_CLI_MISSING: Could not
