@@ -13,7 +13,7 @@
     "build:dmg": "npm run clean && cd ../node && npm run build && cd ../node-ui && npm run build && npm run tauri -- build"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-os": "^2.3.2",
     "@tauri-apps/plugin-process": "^2.3.1",
