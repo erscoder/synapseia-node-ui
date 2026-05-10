@@ -63,30 +63,6 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-## Release Workflow
-
-Releases are automated via GitHub Actions. Push a version tag to trigger builds:
-
-```bash
-git tag node-ui-v0.4.0
-git push origin node-ui-v0.4.0
-```
-
-The CI pipeline builds for macOS (arm64 + x64), Linux, and Windows, then creates a draft GitHub Release with all artifacts including `latest.json` for auto-updates.
-
-**Required GitHub Secrets:**
-
-| Secret | Description |
-|--------|-------------|
-| `TAURI_SIGNING_PRIVATE_KEY` | Ed25519 private key for signing update bundles |
-| `TAURI_SIGNING_KEY_PASSWORD` | Password for the signing key |
-
-Generate a signing keypair with:
-
-```bash
-pnpm tauri signer generate -w ~/.tauri/synapseia-node-ui.key
-```
-
 ## Version Policy
 
 Synapseia Node UI, Node CLI, and Coordinator always share the **same version number**. When any component is released, all three are bumped together so node operators know exactly which versions are compatible.
