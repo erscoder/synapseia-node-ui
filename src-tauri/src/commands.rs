@@ -1260,11 +1260,29 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
         },
     );
 
+    // Best-effort uninstall of the legacy `@synapseia/node` (pre-rename)
+    // package. The two bins (`synapseia`, `syn`) collide on the new install
+    // path with EEXIST when an older global install lingers from before the
+    // npm scope rename. Errors here are ignored on purpose — the most
+    // common case is "package not installed" which is fine.
     let path_env = augmented_path();
+    let npm_bin_uninstall = npm_bin.clone();
+    let path_env_uninstall = path_env.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&npm_bin_uninstall)
+            .arg("uninstall")
+            .arg("-g")
+            .arg("@synapseia/node")
+            .env("PATH", path_env_uninstall)
+            .output()
+    })
+    .await;
+
     let install_result = tokio::task::spawn_blocking(move || {
         std::process::Command::new(&npm_bin)
             .arg("install")
             .arg("-g")
+            .arg("--force")
             .arg("@synapseia-network/node")
             .env("PATH", path_env)
             .output()

@@ -138,10 +138,12 @@ function App() {
         setInstallProgress("Checking @synapseia-network/node CLI…");
         await invoke<string>("install_synapseia_node");
       } catch (e) {
+        // Install failure must not strand the user: surface the error,
+        // log it, and fall through to the wallet check. handleStartNode
+        // will retry the install when the user clicks Start.
         const msg = e instanceof Error ? e.message : String(e);
+        console.warn("[boot] install_synapseia_node failed:", msg);
         setInstallError(msg);
-        setBootPhase("checking");
-        return;
       }
 
       try {
