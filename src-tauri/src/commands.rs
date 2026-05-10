@@ -1123,13 +1123,20 @@ fn find_synapseia_node() -> Result<String, String> {
     // a partial-state miss prevents callers from spawning against a half-
     // populated install while another invocation is still running `npm i -g`.
 
-    // 1. explicit override
-    if let Ok(p) = std::env::var("SYNAPSEIA_NODE_PATH") {
-        let pb = PathBuf::from(&p);
-        let dist_ok = pb.join("dist/index.js").exists();
-        let pkg_ok = pb.join("package.json").exists();
-        if dist_ok && pkg_ok {
-            return Ok(p);
+    // 1. explicit override (debug builds only).
+    //    Honoring SYNAPSEIA_NODE_PATH in release builds is a privilege-escalation
+    //    surface: any process able to write the user shell rc could redirect the
+    //    locator to a hostile dist/index.js. The dev override is useful when
+    //    iterating from the monorepo, so we keep it gated on debug_assertions.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(p) = std::env::var("SYNAPSEIA_NODE_PATH") {
+            let pb = PathBuf::from(&p);
+            let dist_ok = pb.join("dist/index.js").exists();
+            let pkg_ok = pb.join("package.json").exists();
+            if dist_ok && pkg_ok {
+                return Ok(p);
+            }
         }
     }
 
@@ -1157,7 +1164,16 @@ fn find_synapseia_node() -> Result<String, String> {
         let dist_ok = std::path::Path::new(&format!("{}/dist/index.js", c)).exists();
         let pkg_ok = std::path::Path::new(&format!("{}/package.json", c)).exists();
         if dist_ok && pkg_ok {
-            return Ok(c);
+            // Defense-in-depth: confirm the package.json identifies as
+            // @synapseia-network/node before trusting the path. Substring check
+            // (no serde_json) — covers both `"name": "..."` and `"name":"..."`.
+            if let Ok(pkg_text) = std::fs::read_to_string(format!("{}/package.json", c)) {
+                if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
+                    || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
+                {
+                    return Ok(c);
+                }
+            }
         }
     }
 
@@ -1175,7 +1191,19 @@ fn find_synapseia_node() -> Result<String, String> {
                     let dist_ok = std::path::Path::new(&format!("{}/dist/index.js", c)).exists();
                     let pkg_ok = std::path::Path::new(&format!("{}/package.json", c)).exists();
                     if dist_ok && pkg_ok {
-                        return Ok(c);
+                        // Defense-in-depth: an attacker who can swap the npm
+                        // binary or hijack PATH could yield a bogus root.
+                        // Confirm the discovered package.json identifies as
+                        // @synapseia-network/node before returning.
+                        if let Ok(pkg_text) =
+                            std::fs::read_to_string(format!("{}/package.json", c))
+                        {
+                            if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
+                                || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
+                            {
+                                return Ok(c);
+                            }
+                        }
                     }
                 }
             }
