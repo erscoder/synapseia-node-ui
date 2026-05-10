@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +36,17 @@ const BUNDLED_NODE_VERSION: &str = "22.20.0";
 static INSTALL_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 fn install_lock() -> &'static tokio::sync::Mutex<()> {
     INSTALL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+// Separate from INSTALL_LOCK on purpose: the install path holds INSTALL_LOCK
+// across an `npm install -g` and then calls `ensure_node_runtime`, which is
+// not reentrant on tokio::sync::Mutex — sharing one lock would deadlock.
+// This lock guards the bundled-node download/extract so a future caller that
+// reaches `ensure_node_runtime` outside the install flow can't race a
+// concurrent install on the same staging dir.
+static NODE_RUNTIME_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn node_runtime_lock() -> &'static tokio::sync::Mutex<()> {
+    NODE_RUNTIME_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Commands that send on-chain transactions and must use the longer timeout.
@@ -1160,6 +1171,10 @@ fn bundled_node_archive_url() -> Option<(String, &'static str)> {
 /// `~/.synapseia/node/`, then a fresh download from nodejs.org. Emits
 /// `install-progress` events so the UI can show download status.
 async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    // Acquire BEFORE the system-locate fast path so two concurrent callers
+    // don't race fs probes and concurrent bundled-node downloads.
+    let _guard = node_runtime_lock().lock().await;
+
     if let Some(p) = locate_node_binary() {
         return Ok(p);
     }
@@ -1196,6 +1211,61 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         .await
         .map_err(|e| format!("Node download body read failed: {e}"))?;
 
+    // Official archive filename, exactly as it appears in SHASUMS256.txt.
+    // bundled_node_archive_url() always returns a URL ending in this name.
+    let archive_basename = url
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| format!("Could not derive archive filename from URL {url}"))?
+        .to_string();
+
+    // Fetch the official checksum manifest. Hard-fail on network blip — we
+    // never extract an unverified tarball.
+    let shasums_url = format!(
+        "https://nodejs.org/dist/v{}/SHASUMS256.txt",
+        BUNDLED_NODE_VERSION
+    );
+    let shasums_resp = reqwest::get(&shasums_url)
+        .await
+        .map_err(|e| format!("SHASUMS256 download failed: {e}"))?;
+    if !shasums_resp.status().is_success() {
+        return Err(format!("SHASUMS256 HTTP {}", shasums_resp.status()));
+    }
+    let shasums_text = shasums_resp
+        .text()
+        .await
+        .map_err(|e| format!("SHASUMS256 body read failed: {e}"))?;
+    let expected_hash = shasums_text
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let name = parts.next()?;
+            if name == archive_basename {
+                Some(hash.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "SHASUMS256.txt did not list {archive_basename} for v{}",
+                BUNDLED_NODE_VERSION
+            )
+        })?;
+
+    let actual_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "SHA256 mismatch for {archive_basename}: expected {expected_hash}, got {actual_hash}"
+        ));
+    }
+
     let arch = std::env::consts::ARCH;
     let archive_name = format!(
         "synapseia-node-v{}-{}.{}",
@@ -1205,11 +1275,25 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     std::fs::write(&archive_path, &bytes)
         .map_err(|e| format!("Failed to write Node archive to temp dir: {e}"))?;
 
-    let staging = std::env::temp_dir().join(format!(
-        "synapseia-node-staging-v{}-{}",
+    // RAII cleanup so a failed extraction doesn't leak a ~30 MB tarball.
+    struct ArchiveCleanup<'a>(&'a Path);
+    impl Drop for ArchiveCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _archive_cleanup = ArchiveCleanup(&archive_path);
+
+    // Stage under synapseia_home() so the final rename(staging/inner ->
+    // ~/.synapseia/node) is always intra-fs and atomic. /tmp can live on
+    // a different filesystem (tmpfs vs ext4) on Linux.
+    let synapseia_root = synapseia_home();
+    std::fs::create_dir_all(&synapseia_root)
+        .map_err(|e| format!("Failed to create synapseia home: {e}"))?;
+    let staging = synapseia_root.join(format!(
+        "node-staging-v{}-{}",
         BUNDLED_NODE_VERSION, arch
     ));
-    // Wipe any partial extraction from a previous failed run.
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .map_err(|e| format!("Failed to create staging dir: {e}"))?;
@@ -1263,7 +1347,7 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         .find(|p| p.is_dir())
         .ok_or_else(|| "Extracted archive contained no top-level directory".to_string())?;
 
-    let target_root = synapseia_home().join("node");
+    let target_root = synapseia_root.join("node");
     if let Some(parent) = target_root.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create install parent dir: {e}"))?;
@@ -1284,7 +1368,21 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     })?;
 
     let _ = std::fs::remove_dir_all(&staging);
-    let _ = std::fs::remove_file(&archive_path);
+
+    // Best-effort macOS quarantine strip. Most files have no xattr; failures
+    // are expected and ignored. /usr/bin/xattr ships with every macOS install.
+    #[cfg(target_os = "macos")]
+    {
+        let target_str = target_root.to_string_lossy().to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("xattr")
+                .arg("-dr")
+                .arg("com.apple.quarantine")
+                .arg(&target_str)
+                .output()
+        })
+        .await;
+    }
 
     let final_bin = bundled_node_bin_path();
     if !final_bin.exists() {
