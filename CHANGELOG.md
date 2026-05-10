@@ -1,5 +1,29 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] chore(security): tauri 2.11 + locator hardening + version 0.8.5 → 0.8.6 (d670a8f)
+
+Closes Tauri GHSA-7gmj-67g7-phm9 (CVSS 6.1) by bumping
+`tauri = "2.11"` in `src-tauri/Cargo.toml` (was `"2"` resolving to
+2.10.3). Cargo.lock refreshed with the matching tauri-build,
+tauri-codegen, tauri-macros, tauri-runtime, tauri-runtime-wry,
+tauri-utils, tao, wry, muda, tray-icon updates.
+
+Two source-level locator hardenings (`src-tauri/src/commands.rs`)
+addressing reviewer findings on the just-shipped auto-install path:
+
+- **M-1**: the `SYNAPSEIA_NODE_PATH` env override (dev-mode only)
+  is now gated behind `#[cfg(debug_assertions)]`. Release builds
+  no longer honor the env var, removing an attack surface where a
+  user-writable shell rc could redirect the desktop app to a
+  hostile `dist/index.js`.
+- **M-2**: the `npm root -g` and hardcoded `npm_roots` branches
+  now content-validate the resolved `package.json` (substring
+  match on `"name": "@synapseia-network/node"`) before trusting
+  the install. Defends against a malicious npm shim earlier on
+  PATH or a write-where attacker on the global node_modules dir.
+
+Version bumped to 0.8.6 to keep coord/node/node-ui in sync.
+
 ## [2026-05-10] feat(autoinstall): npm-install @synapseia-network/node CLI when missing (2155d6f)
 
 The desktop app now auto-installs the `@synapseia-network/node` CLI
