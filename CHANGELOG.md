@@ -1,5 +1,37 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] feat(autoinstall): auto-download Node.js v22 LTS when system has none (df76734)
+
+Closes the last hard-fail in the install chain: the desktop app
+no longer requires the user to have Node.js pre-installed. When
+`locate_node_binary()` returns None and no bundled runtime is
+present yet at `~/.synapseia/node/`, the new `ensure_node_runtime`
+helper downloads the official Node v22 LTS tarball from
+nodejs.org/dist for the host platform/arch (darwin-arm64,
+darwin-x64, linux-x64, linux-arm64, win-x64), shells out to
+`tar -xf` (xz/gz/zip auto-detect on macOS/Linux/Windows 10+) into
+a staging dir, strips the version-prefixed top-level dir, and
+plants `~/.synapseia/node/bin/node` + `bin/npm` (or `node.exe` +
+`npm.cmd` on Windows). The subsequent
+`npm install -g @synapseia-network/node` runs against that
+bundled toolchain. Node version pinned via `BUNDLED_NODE_VERSION`
+constant — bump deliberately when LTS rolls forward.
+
+`find_synapseia_node()` gained a probe for
+`~/.synapseia/node/lib/node_modules/@synapseia-network/node` so
+post-install lookups against the bundled runtime succeed.
+
+New install-progress phases: `downloading-node` and `node-ready`.
+Frontend already pipes the events through to the existing
+spinner copy, no UI changes needed. Total first-boot install on
+a Node-less machine is ~30 MB download + ~5 s extract + the
+~5 s npm install — under a minute on broadband.
+
+Unsupported platforms (FreeBSD, OpenBSD, 32-bit, ARM Windows,
+RISC-V) still return the manual-install message.
+
+Version bumped to 0.8.9.
+
 ## [2026-05-10] fix(autoinstall): legacy bin collision + non-fatal boot install (2a5307b)
 
 Two follow-ups to the 0.8.7 boot-time auto-install:
