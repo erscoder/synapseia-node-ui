@@ -75,4 +75,4 @@ Synapseia Node UI, Node CLI, and Coordinator always share the **same version num
 
 ## License
 
-Proprietary. All rights reserved.
+Functional Source License 1.1 with Apache 2.0 future license (`FSL-1.1-ALv2`). See [`LICENSE`](./LICENSE).

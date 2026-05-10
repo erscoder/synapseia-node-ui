@@ -4,6 +4,7 @@ version = "0.8.5"
 description = "Synapseia Node Desktop UI"
 authors = ["Synapseia"]
 edition = "2021"
+license-file = "../LICENSE"
 
 [lib]
 name = "synapseia_node_ui_lib"
