@@ -1,5 +1,26 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] feat(autoinstall): npm-install @synapseia-network/node CLI when missing (2155d6f)
+
+The desktop app now auto-installs the `@synapseia-network/node` CLI
+from the public npm registry when it can't locate it on disk. New
+Tauri command `install_synapseia_node` runs `npm install -g
+@synapseia-network/node` via `tokio::task::spawn_blocking`, emits
+`install-progress` events to the UI, detects EACCES with a sudo
+hint, and re-verifies the install before reporting success. The
+locator (`find_synapseia_node`) gained an `npm root -g` fallback so
+non-standard global prefixes (nvm/volta/fnm) are picked up. The
+frontend wires a new `installing-node` boot phase: if `start_node`
+fails with the typed error code `ERR_CLI_MISSING`, the UI auto-
+triggers the installer, shows a spinner + progress text, and
+retries `start_node` on completion. Re-entrancy guarded on both
+sides — `tokio::sync::Mutex` on the Rust side, `installingRef` on
+the React side. Locator branches now require BOTH `dist/index.js`
+AND `package.json` to defeat partial-write races during install.
+Also updates the `@synapseia/node` literal references throughout
+the locator + install paths to the new `@synapseia-network/node`
+package name.
+
 ## [2026-05-09] chore(version): align to 0.8.5 with coord + node (c146628)
 
 Version-only bump 0.8.4 → 0.8.5 across `package.json`,
