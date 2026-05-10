@@ -23,6 +23,12 @@ const ON_CHAIN_CLI_TIMEOUT: Duration = Duration::from_secs(120);
 /// to decide whether to trigger the auto-install fallback.
 pub const ERR_CLI_MISSING: &str = "ERR_CLI_MISSING";
 
+/// Pinned Node.js LTS version downloaded when the user has no system node.
+/// Bump deliberately when LTS rolls forward — the bundled runtime never
+/// auto-updates after first install. Verified live on
+/// https://nodejs.org/dist/ at the time of this change.
+const BUNDLED_NODE_VERSION: &str = "22.20.0";
+
 /// Serializes concurrent `install_synapseia_node` invocations so a double-click
 /// on Start can't fire two parallel `npm install -g` runs. The second waiter
 /// re-checks `find_synapseia_node()` after the lock releases and returns the
@@ -989,7 +995,14 @@ fn build_node_command(args: &[&str]) -> Result<Command, String> {
     let node_path = find_synapseia_node()?;
     let script_path = format!("{}/dist/index.js", node_path);
 
+    // Prefer system node, fall back to the bundled runtime under
+    // ~/.synapseia/node/. install_synapseia_node downloads the latter when
+    // the user has no system install, and we keep using it across launches.
     let node_bin = locate_node_binary()
+        .or_else(|| {
+            let bundled = bundled_node_bin_path();
+            if bundled.exists() { Some(bundled) } else { None }
+        })
         .ok_or_else(|| "Could not find the `node` binary. Install Node.js (>=18) — e.g. `brew install node` — then relaunch Synapseia Node.".to_string())?;
 
     let mut cmd = Command::new(&node_bin);
@@ -997,7 +1010,12 @@ fn build_node_command(args: &[&str]) -> Result<Command, String> {
     for a in args {
         cmd.arg(a);
     }
-    cmd.env("PATH", augmented_path());
+    let path_env = if let Some(parent) = node_bin.parent() {
+        format!("{}:{}", parent.to_string_lossy(), augmented_path())
+    } else {
+        augmented_path()
+    };
+    cmd.env("PATH", path_env);
     Ok(cmd)
 }
 
@@ -1082,6 +1100,209 @@ fn locate_npm_binary() -> Option<PathBuf> {
     }
 
     which_in_path(npm_name)
+}
+
+#[derive(Serialize, Clone)]
+struct InstallProgress {
+    phase: &'static str,
+    message: String,
+}
+
+/// Resolve the matched `npm` (or `npm.cmd` on Windows) sibling for a known
+/// `node` binary. Used by the bundled-runtime install path where the system
+/// `locate_npm_binary()` lookup would happily resolve to the wrong toolchain.
+fn npm_for(node_bin: &std::path::Path) -> Option<PathBuf> {
+    let npm_name = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let parent = node_bin.parent()?;
+    let candidate = parent.join(npm_name);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Path to the bundled Node binary inside the per-user Synapseia home — the
+/// layout we install into is platform-specific (Unix has `bin/node`, Windows
+/// puts `node.exe` in the install root).
+fn bundled_node_bin_path() -> PathBuf {
+    let root = synapseia_home().join("node");
+    if cfg!(windows) {
+        root.join("node.exe")
+    } else {
+        root.join("bin/node")
+    }
+}
+
+/// Resolve the URL + archive kind for the bundled Node tarball matching the
+/// host platform. Returns None on architectures we don't ship for (FreeBSD,
+/// 32-bit, etc.) — caller surfaces a clear error.
+fn bundled_node_archive_url() -> Option<(String, &'static str)> {
+    let v = BUNDLED_NODE_VERSION;
+    let base = format!("https://nodejs.org/dist/v{v}");
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        Some((format!("{base}/node-v{v}-darwin-arm64.tar.gz"), "tar.gz"))
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        Some((format!("{base}/node-v{v}-darwin-x64.tar.gz"), "tar.gz"))
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        Some((format!("{base}/node-v{v}-linux-x64.tar.xz"), "tar.xz"))
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        Some((format!("{base}/node-v{v}-linux-arm64.tar.xz"), "tar.xz"))
+    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        Some((format!("{base}/node-v{v}-win-x64.zip"), "zip"))
+    } else {
+        None
+    }
+}
+
+/// Returns a path to a working `node` binary. Tries (in order): system PATH +
+/// well-known locations, the previously-bundled runtime under
+/// `~/.synapseia/node/`, then a fresh download from nodejs.org. Emits
+/// `install-progress` events so the UI can show download status.
+async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(p) = locate_node_binary() {
+        return Ok(p);
+    }
+
+    let bundled = bundled_node_bin_path();
+    if bundled.exists() {
+        return Ok(bundled);
+    }
+
+    let (url, kind) = bundled_node_archive_url().ok_or_else(|| {
+        "No prebuilt Node.js runtime is available for this platform/architecture. Install Node.js 20+ from https://nodejs.org/ manually."
+            .to_string()
+    })?;
+
+    let _ = app.emit(
+        "install-progress",
+        InstallProgress {
+            phase: "downloading-node",
+            message: format!(
+                "Downloading Node.js v{} (~30 MB)...",
+                BUNDLED_NODE_VERSION
+            ),
+        },
+    );
+
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Node download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Node download HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Node download body read failed: {e}"))?;
+
+    let arch = std::env::consts::ARCH;
+    let archive_name = format!(
+        "synapseia-node-v{}-{}.{}",
+        BUNDLED_NODE_VERSION, arch, kind
+    );
+    let archive_path = std::env::temp_dir().join(&archive_name);
+    std::fs::write(&archive_path, &bytes)
+        .map_err(|e| format!("Failed to write Node archive to temp dir: {e}"))?;
+
+    let staging = std::env::temp_dir().join(format!(
+        "synapseia-node-staging-v{}-{}",
+        BUNDLED_NODE_VERSION, arch
+    ));
+    // Wipe any partial extraction from a previous failed run.
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("Failed to create staging dir: {e}"))?;
+
+    let archive_for_extract = archive_path.clone();
+    let staging_for_extract = staging.clone();
+    let kind_str = kind.to_string();
+    let extract_result: Result<(), String> = tokio::task::spawn_blocking(move || {
+        // tar handles gzip + xz natively on macOS/Linux; Windows 10+ ships
+        // bsdtar which also reads zip archives. PowerShell Expand-Archive is
+        // the fallback if tar isn't on PATH for some reason.
+        let status = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(&archive_for_extract)
+            .arg("-C")
+            .arg(&staging_for_extract)
+            .status()
+            .map_err(|e| format!("tar invocation failed: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        if cfg!(windows) && kind_str == "zip" {
+            let staging_str = staging_for_extract.to_string_lossy().into_owned();
+            let archive_str = archive_for_extract.to_string_lossy().into_owned();
+            let ps = format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                archive_str.replace('\'', "''"),
+                staging_str.replace('\'', "''")
+            );
+            let status = std::process::Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg(&ps)
+                .status()
+                .map_err(|e| format!("PowerShell Expand-Archive failed: {e}"))?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+        Err("Archive extraction failed (tar/Expand-Archive)".to_string())
+    })
+    .await
+    .map_err(|e| format!("Extraction task panicked: {e}"))?;
+    extract_result?;
+
+    // Official tarballs unpack to a single `node-vX.Y.Z-os-arch/` directory.
+    // Strip that prefix so the install layout is stable across version bumps.
+    let inner = std::fs::read_dir(&staging)
+        .map_err(|e| format!("Failed to read staging dir: {e}"))?
+        .filter_map(|e| e.ok().map(|d| d.path()))
+        .find(|p| p.is_dir())
+        .ok_or_else(|| "Extracted archive contained no top-level directory".to_string())?;
+
+    let target_root = synapseia_home().join("node");
+    if let Some(parent) = target_root.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create install parent dir: {e}"))?;
+    }
+    // If a previous half-installed runtime exists, remove it to keep the
+    // rename atomic. We just verified bundled_node_bin_path() didn't exist
+    // above, but a partial dir without bin/node could still be lurking.
+    if target_root.exists() {
+        std::fs::remove_dir_all(&target_root)
+            .map_err(|e| format!("Failed to clear stale runtime dir: {e}"))?;
+    }
+    std::fs::rename(&inner, &target_root).map_err(|e| {
+        format!(
+            "Failed to move extracted runtime into place: {e} (from {} to {})",
+            inner.display(),
+            target_root.display()
+        )
+    })?;
+
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_file(&archive_path);
+
+    let final_bin = bundled_node_bin_path();
+    if !final_bin.exists() {
+        return Err(format!(
+            "Node runtime install completed but binary not found at {}",
+            final_bin.display()
+        ));
+    }
+
+    let _ = app.emit(
+        "install-progress",
+        InstallProgress {
+            phase: "node-ready",
+            message: format!("Node.js v{} installed", BUNDLED_NODE_VERSION),
+        },
+    );
+
+    Ok(final_bin)
 }
 
 
@@ -1177,6 +1398,24 @@ fn find_synapseia_node() -> Result<String, String> {
         }
     }
 
+    // 3b. bundled runtime install: when the user has no system Node, the app
+    //     downloads Node into ~/.synapseia/node/ and `npm install -g` lands
+    //     under <prefix>/lib/node_modules/.
+    if let Some(home) = dirs::home_dir() {
+        let bundled = home.join(".synapseia/node/lib/node_modules/@synapseia-network/node");
+        let dist_ok = bundled.join("dist/index.js").exists();
+        let pkg_ok = bundled.join("package.json").exists();
+        if dist_ok && pkg_ok {
+            if let Ok(pkg_text) = std::fs::read_to_string(bundled.join("package.json")) {
+                if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
+                    || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
+                {
+                    return Ok(bundled.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
     // 4. ask npm itself where it puts global packages. Covers nvm/volta/fnm
     //    layouts we don't hard-code above. ~1-2 s cold-start cost is acceptable
     //    because this only runs after the cheaper checks miss.
@@ -1216,12 +1455,6 @@ fn find_synapseia_node() -> Result<String, String> {
     ))
 }
 
-#[derive(Serialize, Clone)]
-struct InstallProgress {
-    phase: &'static str,
-    message: String,
-}
-
 #[tauri::command]
 pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     // Acquire BEFORE the early-return check so concurrent callers serialize.
@@ -1240,17 +1473,26 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
         return Ok(path);
     }
 
-    if locate_node_binary().is_none() {
-        return Err(
-            "Node.js not found. Install Node.js 20+ from https://nodejs.org/ and restart this app."
-                .to_string(),
-        );
-    }
+    let node_bin = match ensure_node_runtime(&app).await {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Node runtime setup failed: {e}")),
+    };
 
-    let npm_bin = locate_npm_binary().ok_or_else(|| {
-        "npm not found alongside node binary. Reinstall Node.js to ensure npm is included."
-            .to_string()
-    })?;
+    let npm_bin = npm_for(&node_bin)
+        .or_else(locate_npm_binary)
+        .ok_or_else(|| {
+            "npm not found alongside node binary. Reinstall Node.js to ensure npm is included."
+                .to_string()
+        })?;
+
+    // Put the resolved node's directory first on PATH so npm post-install
+    // scripts and lifecycle hooks resolve to the SAME node we just located
+    // (matters for the bundled runtime case — the system PATH may not see it).
+    let path_env = if let Some(parent) = node_bin.parent() {
+        format!("{}:{}", parent.to_string_lossy(), augmented_path())
+    } else {
+        augmented_path()
+    };
 
     let _ = app.emit(
         "install-progress",
@@ -1265,7 +1507,6 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     // path with EEXIST when an older global install lingers from before the
     // npm scope rename. Errors here are ignored on purpose — the most
     // common case is "package not installed" which is fine.
-    let path_env = augmented_path();
     let npm_bin_uninstall = npm_bin.clone();
     let path_env_uninstall = path_env.clone();
     let _ = tokio::task::spawn_blocking(move || {
