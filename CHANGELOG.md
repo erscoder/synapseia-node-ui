@@ -1,5 +1,36 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] fix(security): SHA256 verify Node tarball + serialize runtime + macOS quarantine (ae6db36)
+
+Three fixes from the 0.8.9 reviewer pass on `ensure_node_runtime`:
+
+- **BLOCKER (SHA256 verify)**: every Node tarball downloaded from
+  `nodejs.org/dist/` is now sha256-checked against the official
+  `SHASUMS256.txt` BEFORE extraction. Mismatch or manifest fetch
+  failure hard-fails the install. Closes the MITM surface where
+  a hostile network or DNS hijack could swap the tarball.
+  Adds `sha2 = "0.10"` to Cargo.toml.
+- **HIGH (concurrent runtime download)**: new
+  `NODE_RUNTIME_LOCK` static `tokio::sync::Mutex` acquired at
+  the very start of `ensure_node_runtime`. Coexists with
+  `INSTALL_LOCK` — separate locks (Option A) avoid the
+  non-reentrant `tokio::sync::Mutex` deadlock that a single
+  combined lock would have introduced.
+- **HIGH (macOS Gatekeeper)**: best-effort
+  `xattr -dr com.apple.quarantine` on the extracted runtime
+  tree (gated `#[cfg(target_os = "macos")]`). Defends against
+  binaries refusing to launch under stricter Gatekeeper
+  policies.
+
+Bonus mediums folded in: `ArchiveCleanup` RAII guard ensures the
+tarball is deleted on every exit path (no more 30 MB leak in
+`/tmp` on extract failure), and the staging directory moved to
+`~/.synapseia/node-staging-vX.Y.Z/` so the final
+`rename(inner, target_root)` is intra-fs and atomic on
+cross-device setups (Linux tmpfs `/tmp` vs ext4 `/home`).
+
+Version bumped to 0.8.10 (sync with coord + node).
+
 ## [2026-05-10] feat(autoinstall): auto-download Node.js v22 LTS when system has none (df76734)
 
 Closes the last hard-fail in the install chain: the desktop app
