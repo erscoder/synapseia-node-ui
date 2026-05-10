@@ -1,5 +1,26 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-10] fix(autoinstall): run install_synapseia_node at boot, not just on Start (fad89a8)
+
+Existing-wallet users were hitting `ERR_CLI_MISSING: Could not
+locate @synapseia-network/node` after upgrading from a pre-rename
+build because the auto-install fallback only fired inside
+`handleStartNode`. If the user never reached the Start button (or
+the CLI was wiped between sessions) the desktop app would surface
+the locate error in the LogViewer instead of installing.
+
+Fix: chain `install_synapseia_node` -> `wallet_exists` in the boot
+useEffect so EVERY launch verifies the CLI is on disk before
+deciding create-vs-unlock. The Tauri command is idempotent — early
+return when the package is already installed, so the common path
+adds <100 ms. The `handleStartNode` fallback stays as a secondary
+safety net for cases where the CLI vanishes between unlock and
+start. Dismiss button on the install-error screen now re-routes
+through `wallet_exists` instead of forcing `unlocked` (the wallet
+might not be unlocked yet at boot time).
+
+Version bumped to 0.8.7 (sync with coord + node).
+
 ## [2026-05-10] fix(deps): @tauri-apps/api ^2.11 to match Cargo tauri 2.11 (d20ca3e)
 
 The 0.8.6 release CI failed with the Tauri version-mismatch
