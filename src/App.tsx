@@ -77,15 +77,23 @@ export interface ChainInfo {
   nodeName: string | null;
 }
 
-type BootPhase = "checking" | "needs-create" | "needs-unlock" | "unlocked" | "needs-activation";
+type BootPhase = "checking" | "needs-create" | "needs-unlock" | "unlocked" | "needs-activation" | "installing-node";
 
 function App() {
   const [bootPhase, setBootPhase] = useState<BootPhase>("checking");
   const [password, setPassword] = useState<string | null>(null);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [installProgress, setInstallProgress] = useState<string>("");
   const [activePanel, setActivePanel] = useState<Panel>("my-node");
   const mainRef = useRef<HTMLElement | null>(null);
+  // Re-entrancy guard for handleStartNode: a double-click on the Start button
+  // (or a stale React event firing twice) must not spawn two parallel
+  // `start_node`/`install_synapseia_node` flows. The Rust side has its own
+  // mutex on the install path; this ref short-circuits at the UI boundary so
+  // we don't even round-trip to the backend.
+  const installingRef = useRef(false);
 
   // Reset scroll to the top whenever the active panel changes. Without this
   // the <main> container keeps its previous scrollTop, so switching into a
@@ -145,6 +153,15 @@ function App() {
       if (/^\[BETA_LIMIT_REACHED\]/.test(msg)) {
         setBetaLimitModal({ open: true, limit: 0, current: 0 });
       }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<{ phase: string; message: string }>("install-progress", (event) => {
+      setInstallProgress(event.payload.message);
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -235,6 +252,7 @@ function App() {
   }, []);
 
   const handleStartNode = useCallback(async () => {
+    if (installingRef.current) return;
     if (!password) return;
     // Pre-flight capacity probe. We hit the coordinator's public
     // `/peer/capacity` endpoint BEFORE spawning the CLI; on a
@@ -254,11 +272,32 @@ function App() {
       console.warn("check_capacity failed; proceeding to start_node", err);
     }
 
+    installingRef.current = true;
     try {
       const status = await invoke<NodeStatus>("start_node", { password });
       setNodeStatus(status);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("ERR_CLI_MISSING")) {
+        setBootPhase("installing-node");
+        setInstallError(null);
+        setInstallProgress("Preparing installer…");
+        try {
+          await invoke<string>("install_synapseia_node");
+          const status = await invoke<NodeStatus>("start_node", { password });
+          setNodeStatus(status);
+          setBootPhase("unlocked");
+        } catch (installErr) {
+          const ierr = installErr instanceof Error ? installErr.message : String(installErr);
+          setInstallError(ierr);
+        } finally {
+          installingRef.current = false;
+        }
+        return;
+      }
       console.error("Failed to start node", e);
+    } finally {
+      installingRef.current = false;
     }
   }, [password]);
 
@@ -276,6 +315,33 @@ function App() {
       <div className="flex flex-col items-center justify-center min-h-screen bg-[var(--bg-primary)] text-slate-400">
         <p>Checking wallet…</p>
         {bootError && <p className="text-red-400 text-xs mt-2">{bootError}</p>}
+      </div>
+    );
+  }
+
+  if (bootPhase === "installing-node") {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-[var(--bg-primary)] text-slate-200 px-6">
+        <div className="flex flex-col items-center gap-4 max-w-md">
+          <div className="h-12 w-12 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
+          <h1 className="text-lg font-semibold">Setting up Synapseia node</h1>
+          <p className="text-sm text-slate-400 text-center">{installProgress || "Installing @synapseia-network/node CLI from npm…"}</p>
+          {installError && (
+            <div className="mt-4 w-full rounded border border-red-500/40 bg-red-500/10 p-4 text-xs text-red-300 whitespace-pre-line">
+              <p className="font-semibold mb-1">Installation failed</p>
+              <p>{installError}</p>
+              <button
+                onClick={() => {
+                  setInstallError(null);
+                  setBootPhase("unlocked");
+                }}
+                className="mt-3 rounded bg-slate-700 px-3 py-1 text-xs text-slate-100 hover:bg-slate-600"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     );
   }

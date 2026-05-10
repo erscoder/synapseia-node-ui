@@ -18,6 +18,20 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 // ~90 s produces spurious "command timed out" errors for txs that DID land.
 const ON_CHAIN_CLI_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Stable error code for "the @synapseia-network/node CLI is not present on
+/// disk". The frontend matches on this string (not the human-readable suffix)
+/// to decide whether to trigger the auto-install fallback.
+pub const ERR_CLI_MISSING: &str = "ERR_CLI_MISSING";
+
+/// Serializes concurrent `install_synapseia_node` invocations so a double-click
+/// on Start can't fire two parallel `npm install -g` runs. The second waiter
+/// re-checks `find_synapseia_node()` after the lock releases and returns the
+/// already-installed path.
+static INSTALL_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn install_lock() -> &'static tokio::sync::Mutex<()> {
+    INSTALL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Commands that send on-chain transactions and must use the longer timeout.
 const ON_CHAIN_COMMANDS: &[&str] = &[
     "stake",
@@ -970,7 +984,7 @@ pub async fn run_command(
 
 /// Build a tokio Command that invokes `node <dist/index.js> <args...>` with:
 ///   - an augmented PATH (GUI apps on macOS don't inherit shell PATH)
-///   - the located @synapseia/node script
+///   - the located @synapseia-network/node script
 fn build_node_command(args: &[&str]) -> Result<Command, String> {
     let node_path = find_synapseia_node()?;
     let script_path = format!("{}/dist/index.js", node_path);
@@ -1052,6 +1066,25 @@ fn which_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+/// Find an `npm` binary. We prefer the one sibling to the located node binary
+/// because nvm/volta/fnm ship matched pairs and PATH alone can resolve to a
+/// different toolchain than the one we're about to spawn `node` from.
+fn locate_npm_binary() -> Option<PathBuf> {
+    let npm_name = if cfg!(windows) { "npm.cmd" } else { "npm" };
+
+    if let Some(node_bin) = locate_node_binary() {
+        if let Some(bin_dir) = node_bin.parent() {
+            let sibling = bin_dir.join(npm_name);
+            if sibling.exists() {
+                return Some(sibling);
+            }
+        }
+    }
+
+    which_in_path(npm_name)
+}
+
+
 fn augmented_path() -> String {
     let base = std::env::var("PATH").unwrap_or_default();
     let mut extras = vec![
@@ -1084,10 +1117,18 @@ fn augmented_path() -> String {
 }
 
 fn find_synapseia_node() -> Result<String, String> {
+    // Each positive branch requires BOTH dist/index.js AND package.json to
+    // exist — npm writes files in stages, so a mid-flight install can leave
+    // dist/index.js without package.json (or vice-versa). Treating either as
+    // a partial-state miss prevents callers from spawning against a half-
+    // populated install while another invocation is still running `npm i -g`.
+
     // 1. explicit override
     if let Ok(p) = std::env::var("SYNAPSEIA_NODE_PATH") {
         let pb = PathBuf::from(&p);
-        if pb.join("dist/index.js").exists() {
+        let dist_ok = pb.join("dist/index.js").exists();
+        let pkg_ok = pb.join("package.json").exists();
+        if dist_ok && pkg_ok {
             return Ok(p);
         }
     }
@@ -1098,28 +1139,144 @@ fn find_synapseia_node() -> Result<String, String> {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(packages_dir) = manifest.parent().and_then(|p| p.parent()) {
         let candidate = packages_dir.join("node");
-        if candidate.join("dist/index.js").exists() {
+        let dist_ok = candidate.join("dist/index.js").exists();
+        let pkg_ok = candidate.join("package.json").exists();
+        if dist_ok && pkg_ok {
             return Ok(candidate.to_string_lossy().to_string());
         }
     }
 
     // 3. global npm installs (common dev machine) — try both possible node-binary
-    //    roots for @synapseia/node.
+    //    roots for @synapseia-network/node.
     let npm_roots = [
         "/opt/homebrew/lib/node_modules",
         "/usr/local/lib/node_modules",
     ];
     for root in npm_roots {
-        let c = format!("{}/@synapseia/node", root);
-        if std::path::Path::new(&format!("{}/dist/index.js", c)).exists() {
+        let c = format!("{}/@synapseia-network/node", root);
+        let dist_ok = std::path::Path::new(&format!("{}/dist/index.js", c)).exists();
+        let pkg_ok = std::path::Path::new(&format!("{}/package.json", c)).exists();
+        if dist_ok && pkg_ok {
             return Ok(c);
         }
     }
 
-    Err(
-        "Could not locate @synapseia/node. Expected it at ../node relative to this binary or globally installed."
-            .to_string(),
-    )
+    // 4. ask npm itself where it puts global packages. Covers nvm/volta/fnm
+    //    layouts we don't hard-code above. ~1-2 s cold-start cost is acceptable
+    //    because this only runs after the cheaper checks miss.
+    if let Some(npm_bin) = locate_npm_binary() {
+        let mut cmd = std::process::Command::new(&npm_bin);
+        cmd.arg("root").arg("-g").env("PATH", augmented_path());
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !root.is_empty() {
+                    let c = format!("{}/@synapseia-network/node", root);
+                    let dist_ok = std::path::Path::new(&format!("{}/dist/index.js", c)).exists();
+                    let pkg_ok = std::path::Path::new(&format!("{}/package.json", c)).exists();
+                    if dist_ok && pkg_ok {
+                        return Ok(c);
+                    }
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "{}: Could not locate @synapseia-network/node. Expected it at ../node relative to this binary or globally installed.",
+        ERR_CLI_MISSING
+    ))
+}
+
+#[derive(Serialize, Clone)]
+struct InstallProgress {
+    phase: &'static str,
+    message: String,
+}
+
+#[tauri::command]
+pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
+    // Acquire BEFORE the early-return check so concurrent callers serialize.
+    // The second waiter then re-runs find_synapseia_node() and observes the
+    // completed install instead of kicking off a parallel `npm install -g`.
+    let _guard = install_lock().lock().await;
+
+    if let Ok(path) = find_synapseia_node() {
+        let _ = app.emit(
+            "install-progress",
+            InstallProgress {
+                phase: "already-installed",
+                message: "@synapseia-network/node already installed".to_string(),
+            },
+        );
+        return Ok(path);
+    }
+
+    if locate_node_binary().is_none() {
+        return Err(
+            "Node.js not found. Install Node.js 20+ from https://nodejs.org/ and restart this app."
+                .to_string(),
+        );
+    }
+
+    let npm_bin = locate_npm_binary().ok_or_else(|| {
+        "npm not found alongside node binary. Reinstall Node.js to ensure npm is included."
+            .to_string()
+    })?;
+
+    let _ = app.emit(
+        "install-progress",
+        InstallProgress {
+            phase: "starting",
+            message: "Installing @synapseia-network/node from npm registry...".to_string(),
+        },
+    );
+
+    let path_env = augmented_path();
+    let install_result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&npm_bin)
+            .arg("install")
+            .arg("-g")
+            .arg("@synapseia-network/node")
+            .env("PATH", path_env)
+            .output()
+    })
+    .await
+    .map_err(|e| format!("Failed to spawn npm install task: {}", e))?
+    .map_err(|e| format!("Failed to launch npm: {}", e))?;
+
+    if !install_result.status.success() {
+        let stderr = String::from_utf8_lossy(&install_result.stderr);
+        let stderr_lc = stderr.to_lowercase();
+        if stderr_lc.contains("eacces") || stderr_lc.contains("permission denied") {
+            return Err(
+                "Permission denied installing global npm package. Try one of:\n 1. Use a Node version manager (nvm/volta/fnm) to avoid sudo.\n 2. Run 'sudo npm install -g @synapseia-network/node' in a terminal.\nSee: https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally"
+                    .to_string(),
+            );
+        }
+        let tail_start = stderr.len().saturating_sub(1000);
+        return Err(format!(
+            "npm install failed: {}",
+            stderr[tail_start..].trim()
+        ));
+    }
+
+    match find_synapseia_node() {
+        Ok(path) => {
+            let _ = app.emit(
+                "install-progress",
+                InstallProgress {
+                    phase: "complete",
+                    message: "Installation complete".to_string(),
+                },
+            );
+            Ok(path)
+        }
+        Err(_) => Err(
+            "Install reported success but @synapseia-network/node not found. Try restarting the app."
+                .to_string(),
+        ),
+    }
 }
 
 fn extract_pubkey(s: &str) -> Option<String> {
