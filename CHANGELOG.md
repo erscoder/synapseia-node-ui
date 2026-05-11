@@ -1,5 +1,53 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] feat(bundle): ship CLI inside the .dmg/.msi/.AppImage (1c23393)
+
+Closes the recurring "ERR_CLI_MISSING on first launch" failure mode:
+new users without a global Node/npm install (or with permission /
+network issues on `npm install -g`) now get a working node CLI from
+inside the bundle, zero network required.
+
+Priority order in `find_synapseia_node` (unchanged for existing
+users): dev path → homebrew/global npm roots →
+`~/.synapseia/node/lib/node_modules/...` → `npm root -g` dynamic →
+**bundled resource (NEW, last)**. CLI auto-update via
+`npm install -g` continues to take precedence over the bundle.
+
+Implementation:
+- `src-tauri/tauri.conf.json` declares
+  `resources/cli/{dist,node_modules,patches,package.json}` in
+  `bundle.resources`.
+- `src-tauri/src/commands.rs`: `find_synapseia_node` accepts
+  `Option<&AppHandle>` and resolves `app.path().resource_dir() / "cli"`.
+  `build_node_command(app, args)` threads the handle through to all
+  Tauri commands (`start_node`, `fetch_chain_info`, `unlock_wallet`,
+  `create_wallet`, `run_command`). Substring check on bundled
+  `package.json` plus existence check on `dist/index.js` — defense-
+  in-depth (placeholder package name differs from the runtime CLI
+  name).
+- `.github/workflows/release.yml`: per-matrix-runner step now
+  - waits up to 10 min for `@synapseia-network/node@$VERSION` to
+    appear on npm (avoids shipping a stale CLI when node-ui-v* and
+    node-v* tags race),
+  - then `npm install --omit=dev @synapseia-network/node@$VERSION`
+    into a scratch dir on the same platform runner (picks up
+    platform-specific `usearch` native binding), and
+  - copies into `src-tauri/resources/cli/` before `tauri-action`.
+- `scripts/bundle-cli.mjs`: local materializer with workspace and
+  npm modes (version self-pinned from own `package.json`).
+- `package.json`: new `bundle:cli` script, chained into `build:dmg`.
+- `src-tauri/resources/cli/package.json` placeholder uses
+  `@synapseia-network/node-bundle-placeholder` so an empty scaffold
+  can't satisfy the runtime substring check.
+- `.gitignore`: scaffold tracked (`.gitkeep` + placeholder
+  `package.json`), real bundled files ignored.
+
+Bundle size impact: ~150–250 MB per platform. CI prints `du -sh`
+each run.
+
+Reviewer pass: 1 BLOCKER (version pin), 1 HIGH (placeholder name)
+addressed; MEDIUMs (npm cache, progress message clarity) deferred.
+
 ## [2026-05-11] chore(version): align node-ui to 0.8.13 with node + coord (44040d7)
 
 Lockstep with node 0.8.13. UI code unchanged.
