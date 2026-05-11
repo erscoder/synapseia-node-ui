@@ -1,5 +1,13 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] chore(version): align node-ui to 0.8.17 + Linux AppImage fix (765bfef)
+
+Lockstep bump. Pairs with `fix(ci): install libfuse2 for AppImage
+bundling` (9419ed1). The 0.8.16 ubuntu build failed at the
+`linuxdeploy` step because the GitHub ubuntu-22.04 runner stopped
+pre-installing libfuse2 (linuxdeploy is itself an AppImage and
+needs FUSE2 to self-mount). 0.8.17 should ship the AppImage too.
+
 ## [2026-05-11] chore(version): align node-ui to 0.8.16 with coord + node (29fc07e)
 
 Lockstep with `node 0.8.16` (pins `@libp2p/utils@7.1.0` so the
