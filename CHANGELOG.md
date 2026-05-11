@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] chore(version): align node-ui to 0.8.12 with node + coord (0b151e0)
+
+Lockstep with node 0.8.12 (WeakMap iteration on the
+`@libp2p/utils` `onProgress` patch). UI code unchanged.
+
 ## [2026-05-11] chore(version): align node-ui to 0.8.11 with node + coord (a165fac)
 
 Lockstep with node 0.8.11 (libp2p/utils onProgress guard). UI
