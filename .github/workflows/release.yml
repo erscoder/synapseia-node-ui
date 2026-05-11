@@ -188,8 +188,21 @@ jobs:
           else
             mkdir -p "$DEST/patches"
           fi
-          echo "Bundled CLI size:"
+          echo "Bundled CLI size (loose tree, pre-tar):"
           du -sh "$DEST" || true
+          # Tar the entire materialized CLI into ONE opaque archive at
+          # the path Tauri's bundle.resources entry expects. Linux
+          # AppImage's linuxdeploy walks every file under
+          # `resources/cli/node_modules/` (~10k entries including .node
+          # native binaries) and fails silently. A single .tar.gz is
+          # treated as plain data, sidestepping that failure. Pure-Rust
+          # extraction happens at first run in find_synapseia_node.
+          TARBALL="$GITHUB_WORKSPACE/src-tauri/resources/cli-bundle.tar.gz"
+          rm -f "$TARBALL"
+          tar -czf "$TARBALL" -C "$DEST" .
+          rm -rf "$DEST"
+          echo "Bundled CLI tarball size:"
+          du -sh "$TARBALL" || true
 
       - uses: tauri-apps/tauri-action@v0
         env:

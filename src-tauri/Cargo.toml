@@ -1,6 +1,6 @@
 [package]
 name = "synapseia-node-ui"
-version = "0.8.18"
+version = "0.8.19"
 description = "Synapseia Node Desktop UI"
 authors = ["Synapseia"]
 edition = "2021"
@@ -30,3 +30,5 @@ dirs = "5"
 sysinfo = "0.33"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"

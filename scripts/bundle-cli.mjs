@@ -30,7 +30,9 @@ import { execSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const NODE_UI_ROOT = resolve(__dirname, "..");
-const DEST = join(NODE_UI_ROOT, "src-tauri", "resources", "cli");
+const RESOURCES_DIR = join(NODE_UI_ROOT, "src-tauri", "resources");
+const DEST = join(RESOURCES_DIR, "cli");
+const TARBALL = join(RESOURCES_DIR, "cli-bundle.tar.gz");
 
 function rmrf(p) {
   if (existsSync(p)) rmSync(p, { recursive: true, force: true });
@@ -158,6 +160,29 @@ function bundleFromNpm() {
   rmrf(stage);
 }
 
+function tarballAndCleanup() {
+  // Wrap the entire materialized CLI into ONE opaque .tar.gz so the
+  // Tauri bundler (linuxdeploy in particular) treats it as plain data
+  // and doesn't walk ~10k files / `.node` native binaries under
+  // node_modules. Without this, Linux AppImage builds bail silently
+  // with "failed to run linuxdeploy".
+  if (!existsSync(DEST)) {
+    console.error(`[bundle-cli] expected ${DEST} to exist before tarballing`);
+    process.exit(1);
+  }
+  // `-C resources/cli .` packs the contents (not the cli/ dir itself)
+  // so extraction at runtime produces dist/, node_modules/, package.json
+  // directly in the target dir. `tar` is universal on macOS BSD,
+  // Linux GNU, and Windows 10+ bsdtar.
+  rmrf(TARBALL);
+  execSync(`tar -czf "${TARBALL}" -C "${DEST}" .`, { stdio: "inherit" });
+  // Remove the loose copy: Tauri's resources entry only references the
+  // tarball, and leaving the directory in place would double the bundle
+  // size and re-expose the linuxdeploy failure if any future config
+  // accidentally re-included it.
+  rmrf(DEST);
+}
+
 const fromNpm = process.env.SYNAPSEIA_BUNDLE_FROM_NPM === "1";
 if (fromNpm) {
   console.log("[bundle-cli] mode=npm");
@@ -166,4 +191,5 @@ if (fromNpm) {
   console.log("[bundle-cli] mode=workspace");
   bundleFromWorkspace();
 }
-console.log(`[bundle-cli] bundled into ${DEST}`);
+tarballAndCleanup();
+console.log(`[bundle-cli] tarball at ${TARBALL}`);

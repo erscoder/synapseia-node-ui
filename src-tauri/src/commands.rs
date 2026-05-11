@@ -1559,18 +1559,73 @@ fn find_synapseia_node(app: Option<&AppHandle>) -> Result<String, String> {
     //    on first launch with zero network. Sits last so a user-updated npm
     //    install via the existing flow still takes precedence (allows CLI
     //    auto-update without re-downloading the desktop app).
+    //
+    //    The CLI ships as a single opaque tarball (`cli-bundle.tar.gz`) and
+    //    is extracted lazily once per app version into
+    //    ~/.synapseia/bundled-cli/<version>/. The opaque-archive approach
+    //    sidesteps a hard linuxdeploy failure during AppImage bundling:
+    //    linuxdeploy walks every file in `resources/cli/node_modules/`
+    //    (~10k files, ~150-250MB, including `.node` native binaries) and
+    //    bails silently. A single .tar.gz is treated as plain data.
     if let Some(app) = app {
         if let Ok(resource_dir) = app.path().resource_dir() {
-            let bundled = resource_dir.join("cli");
-            let dist_ok = bundled.join("dist/index.js").exists();
-            let pkg_ok = bundled.join("package.json").exists();
-            if dist_ok && pkg_ok {
-                if let Ok(pkg_text) = std::fs::read_to_string(bundled.join("package.json")) {
-                    if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
-                        || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
-                    {
-                        return Ok(bundled.to_string_lossy().to_string());
+            let tarball = resource_dir.join("cli-bundle.tar.gz");
+            // The placeholder committed to git is an empty tarball
+            // (`tar -czf - --files-from /dev/null`) which produces a ~45-byte
+            // archive. Any real CI-produced bundle is >1 MB, so size-gate the
+            // extraction to skip the placeholder cleanly when running from a
+            // dev build that hasn't materialized the CLI yet.
+            const MIN_REAL_BUNDLE_BYTES: u64 = 64 * 1024;
+            let tarball_meta = std::fs::metadata(&tarball).ok();
+            if let Some(meta) = tarball_meta {
+                if meta.len() >= MIN_REAL_BUNDLE_BYTES {
+                    let version = app.package_info().version.to_string();
+                    let cli_dir = synapseia_home().join("bundled-cli").join(&version);
+                    let marker = cli_dir.join(".extracted");
+
+                    if !marker.exists() {
+                        let _ = std::fs::remove_dir_all(&cli_dir);
+                        std::fs::create_dir_all(&cli_dir)
+                            .map_err(|e| format!("mkdir {:?}: {}", cli_dir, e))?;
+                        // Pure-Rust extraction via `flate2` + `tar`. Avoids
+                        // depending on an external `tar` binary (Windows
+                        // pre-1809, minimal Linux containers, hardened mac
+                        // setups can all lack one).
+                        let extract_result: std::io::Result<()> = (|| {
+                            let file = std::fs::File::open(&tarball)?;
+                            let gz = flate2::read::GzDecoder::new(file);
+                            let mut archive = tar::Archive::new(gz);
+                            archive.unpack(&cli_dir)?;
+                            Ok(())
+                        })();
+                        match extract_result {
+                            Ok(()) => {
+                                let _ = std::fs::write(&marker, b"ok");
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "{}: failed to extract bundled CLI from {:?}: {}",
+                                    ERR_CLI_MISSING, tarball, e,
+                                ));
+                            }
+                        }
                     }
+
+                    let dist_ok = cli_dir.join("dist/index.js").exists();
+                    let pkg_ok = cli_dir.join("package.json").exists();
+                    if dist_ok && pkg_ok {
+                        if let Ok(pkg_text) =
+                            std::fs::read_to_string(cli_dir.join("package.json"))
+                        {
+                            if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
+                                || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
+                            {
+                                return Ok(cli_dir.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                    // Tarball was real but extracted contents don't pass the
+                    // sanity gates — fall through to the not-found error.
                 }
             }
         }
