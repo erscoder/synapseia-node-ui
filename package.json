@@ -1,7 +1,7 @@
 {
   "name": "@synapseia/node-ui",
   "private": true,
-  "version": "0.8.20",
+  "version": "0.8.21",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "scripts": {
@@ -10,8 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "clean": "rm -rf dist src-tauri/target/release/bundle && cd src-tauri && cargo clean --release",
-    "bundle:cli": "node scripts/bundle-cli.mjs",
-    "build:dmg": "npm run clean && cd ../node && npm run build && cd ../node-ui && npm run bundle:cli && npm run build && npm run tauri -- build"
+    "build:dmg": "npm run clean && cd ../node && npm run build && cd ../node-ui && npm run build && npm run tauri -- build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11",

@@ -12,18 +12,6 @@ dist
 dist-ssr
 *.local
 
-# Tauri bundle resources — the @synapseia-network/node CLI ships as a
-# single opaque tarball at src-tauri/resources/cli-bundle.tar.gz that is
-# materialized at build time by CI (release.yml) or `pnpm bundle:cli`
-# locally. A committed placeholder (empty .tar.gz) keeps the Tauri
-# resource path resolvable at compile time; the real bundle is regenerated
-# per build. We do NOT track the loose `cli/` directory anymore — it
-# exists only transiently between bundle steps and is removed after the
-# tarball is produced.
-!src-tauri/resources/
-!src-tauri/resources/cli-bundle.tar.gz
-src-tauri/resources/cli/
-
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
