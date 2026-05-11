@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] chore(version): align node-ui to 0.8.11 with node + coord (a165fac)
+
+Lockstep with node 0.8.11 (libp2p/utils onProgress guard). UI
+code unchanged; bumped `package.json`, `Cargo.toml`, and
+`tauri.conf.json` so the release CI tag publishes binaries with
+matching version metadata.
+
 ## [2026-05-10] fix(security): SHA256 verify Node tarball + serialize runtime + macOS quarantine (ae6db36)
 
 Three fixes from the 0.8.9 reviewer pass on `ensure_node_runtime`:
