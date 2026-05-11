@@ -1478,25 +1478,25 @@ fn find_synapseia_node(_app: Option<&AppHandle>) -> Result<String, String> {
         }
     }
 
-    // 3. global npm installs (common dev machine) — try both possible node-binary
-    //    roots for @synapseia-network/node.
-    let npm_roots = [
-        "/opt/homebrew/lib/node_modules",
-        "/usr/local/lib/node_modules",
-    ];
-    for root in npm_roots {
-        let c = format!("{}/@synapseia-network/node", root);
-        let dist_ok = std::path::Path::new(&format!("{}/dist/index.js", c)).exists();
-        let pkg_ok = std::path::Path::new(&format!("{}/package.json", c)).exists();
+    // 3. user-prefix npm-global install (HIGHEST priority after dev path):
+    //    self-update writes `npm install -g` into ~/.synapseia/npm-global/
+    //    via NPM_CONFIG_PREFIX so it never needs sudo. This MUST sit
+    //    before the homebrew/global probe because users who originally
+    //    installed via `npm install -g` (system prefix) leave that copy
+    //    behind on disk; without preferring the user-prefix install here
+    //    the relaunch after self-update keeps picking up the stale
+    //    system copy and the version bump appears not to take effect.
+    if let Some(home) = dirs::home_dir() {
+        let user_prefix =
+            home.join(".synapseia/npm-global/lib/node_modules/@synapseia-network/node");
+        let dist_ok = user_prefix.join("dist/index.js").exists();
+        let pkg_ok = user_prefix.join("package.json").exists();
         if dist_ok && pkg_ok {
-            // Defense-in-depth: confirm the package.json identifies as
-            // @synapseia-network/node before trusting the path. Substring check
-            // (no serde_json) — covers both `"name": "..."` and `"name":"..."`.
-            if let Ok(pkg_text) = std::fs::read_to_string(format!("{}/package.json", c)) {
+            if let Ok(pkg_text) = std::fs::read_to_string(user_prefix.join("package.json")) {
                 if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
                     || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
                 {
-                    return Ok(c);
+                    return Ok(user_prefix.to_string_lossy().to_string());
                 }
             }
         }
@@ -1520,23 +1520,27 @@ fn find_synapseia_node(_app: Option<&AppHandle>) -> Result<String, String> {
         }
     }
 
-    // 3c. user-prefix npm-global install: self-update writes
-    //     `npm install -g` into ~/.synapseia/npm-global/ via
-    //     NPM_CONFIG_PREFIX so it never needs sudo. Same layout as the
-    //     bundled runtime above (<prefix>/lib/node_modules/...). Sits
-    //     before the `npm root -g` probe so a user-prefix install wins
-    //     over a stale system-prefix copy after the migration runs.
-    if let Some(home) = dirs::home_dir() {
-        let user_prefix =
-            home.join(".synapseia/npm-global/lib/node_modules/@synapseia-network/node");
-        let dist_ok = user_prefix.join("dist/index.js").exists();
-        let pkg_ok = user_prefix.join("package.json").exists();
+    // 3c. global npm installs (common dev machine) — homebrew / sudo-installed.
+    //     LOWEST priority among the 3-tier homedir/system checks: if the user
+    //     has BOTH a user-prefix install (3) AND a stale system-prefix copy,
+    //     the user-prefix one wins.
+    let npm_roots = [
+        "/opt/homebrew/lib/node_modules",
+        "/usr/local/lib/node_modules",
+    ];
+    for root in npm_roots {
+        let c = format!("{}/@synapseia-network/node", root);
+        let dist_ok = std::path::Path::new(&format!("{}/dist/index.js", c)).exists();
+        let pkg_ok = std::path::Path::new(&format!("{}/package.json", c)).exists();
         if dist_ok && pkg_ok {
-            if let Ok(pkg_text) = std::fs::read_to_string(user_prefix.join("package.json")) {
+            // Defense-in-depth: confirm the package.json identifies as
+            // @synapseia-network/node before trusting the path. Substring check
+            // (no serde_json) — covers both `"name": "..."` and `"name":"..."`.
+            if let Ok(pkg_text) = std::fs::read_to_string(format!("{}/package.json", c)) {
                 if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
                     || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
                 {
-                    return Ok(user_prefix.to_string_lossy().to_string());
+                    return Ok(c);
                 }
             }
         }
