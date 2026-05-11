@@ -37,6 +37,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "resources/cli/dist": "cli/dist",
+      "resources/cli/package.json": "cli/package.json",
+      "resources/cli/node_modules": "cli/node_modules",
+      "resources/cli/patches": "cli/patches"
+    },
     "category": "Utility",
     "shortDescription": "Synapseia Network Node Control Center",
     "longDescription": "Desktop application to run and manage a Synapseia network node with a user-friendly UI. Supports staking, wallet management, and real-time node monitoring.",

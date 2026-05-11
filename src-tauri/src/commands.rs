@@ -328,8 +328,8 @@ fn parse_vram_gb(s: &str) -> Option<f64> {
 /// which short-circuits BEFORE NestJS bootstrap and queries Solana directly.
 /// No P2P handshakes, no heartbeats, no coordinator noise — just the numbers.
 #[tauri::command]
-pub async fn fetch_chain_info() -> Result<ChainInfo, String> {
-    let mut cmd = build_node_command(&["chain-info"])?;
+pub async fn fetch_chain_info(app: AppHandle) -> Result<ChainInfo, String> {
+    let mut cmd = build_node_command(Some(&app), &["chain-info"])?;
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -487,7 +487,7 @@ fn is_pid_alive(pid: u32) -> bool {
 /// Validate a password by asking the node CLI to decrypt the wallet.
 /// Returns structured success/failure so the UI can show proper errors.
 #[tauri::command]
-pub async fn unlock_wallet(password: String) -> Result<UnlockResult, String> {
+pub async fn unlock_wallet(app: AppHandle, password: String) -> Result<UnlockResult, String> {
     if password.is_empty() {
         return Ok(UnlockResult {
             success: false,
@@ -497,7 +497,7 @@ pub async fn unlock_wallet(password: String) -> Result<UnlockResult, String> {
         });
     }
 
-    let mut cmd = build_node_command(&["wallet-verify"])?;
+    let mut cmd = build_node_command(Some(&app), &["wallet-verify"])?;
     cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -581,6 +581,7 @@ pub async fn unlock_wallet(password: String) -> Result<UnlockResult, String> {
 
 #[tauri::command]
 pub async fn create_wallet(
+    app: AppHandle,
     password: String,
     node_name: String,
     model: Option<String>,
@@ -633,7 +634,7 @@ pub async fn create_wallet(
     }
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let mut cmd = build_node_command(&arg_refs)?;
+    let mut cmd = build_node_command(Some(&app), &arg_refs)?;
     cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -749,7 +750,7 @@ pub async fn start_node(
         ));
     }
 
-    let mut cmd = build_node_command(&["start"])?;
+    let mut cmd = build_node_command(Some(&app), &["start"])?;
     cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password)
         .env("SYNAPSEIA_LAUNCH_SOURCE", "ui")
         .env("NODE_ENV", "production")
@@ -936,6 +937,7 @@ pub async fn get_node_logs(state: State<'_, NodeProcessState>) -> Result<Vec<Str
 
 #[tauri::command]
 pub async fn run_command(
+    app: AppHandle,
     command: String,
     args: Vec<String>,
     password: Option<String>,
@@ -944,7 +946,7 @@ pub async fn run_command(
     all_args.extend(args);
     let arg_refs: Vec<&str> = all_args.iter().map(|s| s.as_str()).collect();
 
-    let mut cmd = build_node_command(&arg_refs)?;
+    let mut cmd = build_node_command(Some(&app), &arg_refs)?;
     if let Some(ref pwd) = password {
         cmd.env("SYNAPSEIA_WALLET_PASSWORD", pwd);
     }
@@ -1002,8 +1004,12 @@ pub async fn run_command(
 /// Build a tokio Command that invokes `node <dist/index.js> <args...>` with:
 ///   - an augmented PATH (GUI apps on macOS don't inherit shell PATH)
 ///   - the located @synapseia-network/node script
-fn build_node_command(args: &[&str]) -> Result<Command, String> {
-    let node_path = find_synapseia_node()?;
+///
+/// `app` is optional so commands without an AppHandle in scope (chain-info,
+/// wallet-verify, run_command) still work — but when provided, the bundled-
+/// inside-resources CLI becomes available as the final safety-net fallback.
+fn build_node_command(app: Option<&AppHandle>, args: &[&str]) -> Result<Command, String> {
+    let node_path = find_synapseia_node(app)?;
     let script_path = format!("{}/dist/index.js", node_path);
 
     // Prefer system node, fall back to the bundled runtime under
@@ -1435,7 +1441,7 @@ fn augmented_path() -> String {
     }
 }
 
-fn find_synapseia_node() -> Result<String, String> {
+fn find_synapseia_node(app: Option<&AppHandle>) -> Result<String, String> {
     // Each positive branch requires BOTH dist/index.js AND package.json to
     // exist — npm writes files in stages, so a mid-flight install can leave
     // dist/index.js without package.json (or vice-versa). Treating either as
@@ -1547,8 +1553,31 @@ fn find_synapseia_node() -> Result<String, String> {
         }
     }
 
+    // 5. bundled CLI inside the .dmg/.msi/.AppImage. This is the SAFETY NET:
+    //    when there is no system node, no global npm package, and no
+    //    ~/.synapseia install yet, the bundled copy keeps the app functional
+    //    on first launch with zero network. Sits last so a user-updated npm
+    //    install via the existing flow still takes precedence (allows CLI
+    //    auto-update without re-downloading the desktop app).
+    if let Some(app) = app {
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            let bundled = resource_dir.join("cli");
+            let dist_ok = bundled.join("dist/index.js").exists();
+            let pkg_ok = bundled.join("package.json").exists();
+            if dist_ok && pkg_ok {
+                if let Ok(pkg_text) = std::fs::read_to_string(bundled.join("package.json")) {
+                    if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
+                        || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
+                    {
+                        return Ok(bundled.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
     Err(format!(
-        "{}: Could not locate @synapseia-network/node. Expected it at ../node relative to this binary or globally installed.",
+        "{}: Could not locate @synapseia-network/node. Expected it at ../node relative to this binary, globally installed, or bundled inside the app resources.",
         ERR_CLI_MISSING
     ))
 }
@@ -1560,7 +1589,7 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     // completed install instead of kicking off a parallel `npm install -g`.
     let _guard = install_lock().lock().await;
 
-    if let Ok(path) = find_synapseia_node() {
+    if let Ok(path) = find_synapseia_node(Some(&app)) {
         let _ = app.emit(
             "install-progress",
             InstallProgress {
@@ -1646,7 +1675,7 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
         ));
     }
 
-    match find_synapseia_node() {
+    match find_synapseia_node(Some(&app)) {
         Ok(path) => {
             let _ = app.emit(
                 "install-progress",

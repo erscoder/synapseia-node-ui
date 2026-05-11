@@ -12,6 +12,33 @@ dist
 dist-ssr
 *.local
 
+# Tauri bundle resources — materialized at build time by CI (release.yml)
+# or by `pnpm bundle:cli` locally. We commit empty placeholders so the
+# Tauri config's `resources` entries validate at compile time; the actual
+# CLI payload is regenerated per build.
+#
+# The earlier `node_modules` / `dist` patterns above would ignore these
+# directories entirely (and the un-ignore line for a parent path can't
+# bring back a child once Git skipped the whole tree). The explicit
+# un-ignores below re-add only the placeholder structure and the
+# package.json marker.
+!src-tauri/resources/
+!src-tauri/resources/cli/
+!src-tauri/resources/cli/package.json
+!src-tauri/resources/cli/dist/
+!src-tauri/resources/cli/dist/.gitkeep
+!src-tauri/resources/cli/node_modules/
+!src-tauri/resources/cli/node_modules/.gitkeep
+!src-tauri/resources/cli/patches/
+!src-tauri/resources/cli/patches/.gitkeep
+# But ignore any *real* materialized content inside.
+src-tauri/resources/cli/dist/*
+!src-tauri/resources/cli/dist/.gitkeep
+src-tauri/resources/cli/node_modules/*
+!src-tauri/resources/cli/node_modules/.gitkeep
+src-tauri/resources/cli/patches/*
+!src-tauri/resources/cli/patches/.gitkeep
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

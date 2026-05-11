@@ -1,0 +1,5 @@
+{
+  "name": "@synapseia-network/node-bundle-placeholder",
+  "version": "0.0.0-placeholder",
+  "description": "PLACEHOLDER — replaced at build time by the workflow / predev script with the real packages/node/package.json. Do not commit changes here. The name field is intentionally NOT the real CLI name so defense-in-depth substring checks in Rust (sidecar detection) cannot match this stub."
+}

@@ -63,6 +63,91 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      # Wait for the matching @synapseia-network/node version to be published
+      # on npm before bundling. node-ui and node share the same version per
+      # release flow (CLAUDE.md "Version sync rule"), and node-ui-vX.Y.Z is
+      # often tagged minutes after node-vX.Y.Z. npm registry propagation can
+      # lag a few minutes, so if we npm-install without waiting we risk
+      # shipping the previous CLI version inside the new .dmg/.msi/.AppImage.
+      - name: Wait for @synapseia-network/node@$VERSION on npm
+        shell: bash
+        run: |
+          set -e
+          VERSION=$(node -p "require('./package.json').version")
+          echo "Waiting for @synapseia-network/node@$VERSION on npm registry..."
+          for i in $(seq 1 20); do
+            if npm view "@synapseia-network/node@$VERSION" version >/dev/null 2>&1; then
+              echo "Found @synapseia-network/node@$VERSION on attempt $i"
+              exit 0
+            fi
+            echo "[$i/20] not yet propagated; sleeping 30s"
+            sleep 30
+          done
+          echo "ERROR: @synapseia-network/node@$VERSION not on npm after 10 minutes."
+          echo "Push node-v$VERSION first, or wait for its publish workflow to finish."
+          exit 1
+
+      # Bundle the @synapseia-network/node CLI INSIDE the Tauri app so first-
+      # launch on a clean machine works WITHOUT npm / network. The npm-install
+      # path remains preferred (lets the CLI auto-update without re-downloading
+      # the desktop app) — this is the safety-net fallback. Runs per-platform
+      # so `node_modules` ships with the right platform-specific prebuilds
+      # (usearch .node binaries, etc.). We install the published CLI into a
+      # scratch dir and copy its dist + node_modules into src-tauri/resources.
+      # Pinned to the node-ui version (synced per release flow) to avoid
+      # registry-propagation races that would ship a stale CLI in a new app.
+      - name: Bundle @synapseia-network/node into Tauri resources
+        shell: bash
+        run: |
+          set -e
+          VERSION=$(node -p "require('./package.json').version")
+          STAGE="$RUNNER_TEMP/syn-cli-stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cd "$STAGE"
+          npm init -y >/dev/null
+          npm install --omit=dev --no-audit --no-fund "@synapseia-network/node@$VERSION"
+          CLI_DIR="$STAGE/node_modules/@synapseia-network/node"
+          DEST="$GITHUB_WORKSPACE/src-tauri/resources/cli"
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          cp -R "$CLI_DIR/dist" "$DEST/"
+          cp "$CLI_DIR/package.json" "$DEST/"
+          # Move the CLI's siblings under node_modules in too (its own deps).
+          # npm hoists dependencies to the top-level node_modules of the
+          # scratch project, so we copy the whole tree minus the CLI's own
+          # entry (the dist/package.json from there is already in DEST).
+          mkdir -p "$DEST/node_modules"
+          # Copy every package except the CLI's own directory.
+          for entry in "$STAGE/node_modules"/*; do
+            name="$(basename "$entry")"
+            if [ "$name" = "@synapseia-network" ]; then
+              # Copy only siblings of `node` under the scope, plus node's
+              # own nested node_modules (its private deps).
+              for scoped in "$entry"/*; do
+                sname="$(basename "$scoped")"
+                if [ "$sname" = "node" ]; then
+                  if [ -d "$scoped/node_modules" ]; then
+                    mkdir -p "$DEST/node_modules/@synapseia-network/node"
+                    cp -R "$scoped/node_modules" "$DEST/node_modules/@synapseia-network/node/"
+                  fi
+                else
+                  mkdir -p "$DEST/node_modules/@synapseia-network"
+                  cp -R "$scoped" "$DEST/node_modules/@synapseia-network/"
+                fi
+              done
+            else
+              cp -R "$entry" "$DEST/node_modules/"
+            fi
+          done
+          if [ -d "$CLI_DIR/patches" ]; then
+            cp -R "$CLI_DIR/patches" "$DEST/"
+          else
+            mkdir -p "$DEST/patches"
+          fi
+          echo "Bundled CLI size:"
+          du -sh "$DEST" || true
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

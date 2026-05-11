@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "clean": "rm -rf dist src-tauri/target/release/bundle && cd src-tauri && cargo clean --release",
-    "build:dmg": "npm run clean && cd ../node && npm run build && cd ../node-ui && npm run build && npm run tauri -- build"
+    "bundle:cli": "node scripts/bundle-cli.mjs",
+    "build:dmg": "npm run clean && cd ../node && npm run build && cd ../node-ui && npm run bundle:cli && npm run build && npm run tauri -- build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11",
