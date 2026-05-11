@@ -1,7 +1,7 @@
 {
   "name": "@synapseia/node-ui",
   "private": true,
-  "version": "0.8.12",
+  "version": "0.8.13",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "scripts": {
