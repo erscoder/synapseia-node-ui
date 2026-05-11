@@ -95,31 +95,32 @@ jobs:
       # launch on a clean machine works WITHOUT npm / network. The npm-install
       # path remains preferred (lets the CLI auto-update without re-downloading
       # the desktop app) — this is the safety-net fallback. Runs per-platform
-      # so `node_modules` ships with the right platform-specific prebuilds
-      # (usearch .node binaries, etc.). We install the published CLI into a
-      # scratch dir and copy its dist + node_modules into src-tauri/resources.
-      # Pinned to the node-ui version (synced per release flow) to avoid
-      # registry-propagation races that would ship a stale CLI in a new app.
+      # so the `usearch` native dep ships with the right platform-specific
+      # prebuilds (.node binaries).
+      #
+      # Single-bundle layout (post 0.8.20): the CLI's `dist/index.js` is a
+      # tsup-bundled ~14MB ESM file with every JS dep inlined. We ship only:
+      #   - `dist/`              (bundled CLI + sourcemap + scripts/)
+      #   - `package.json`       (Rust locator does substring check on `name`)
+      #   - `node_modules/{usearch,bindings,node-gyp-build,node-addon-api,file-uri-to-path}/`
+      #     (native chain — usearch's `import 'bindings'` etc. at load time)
+      # Skipping the rest of `node_modules` drops the tarball from ~200MB
+      # to ~15MB and the extracted footprint from ~365MB to ~70MB.
       - name: Bundle @synapseia-network/node into Tauri resources
         shell: bash
         run: |
           set -e
           VERSION=$(node -p "require('./package.json').version")
-          STAGE="$RUNNER_TEMP/syn-cli-stage"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cd "$STAGE"
-          # Write scratch package.json with overrides BEFORE install so
-          # npm can apply them. Two overrides matter at install time:
-          #
-          #  1. `rpc-websockets > uuid: 8.3.2` — rpc-websockets's
-          #     CJS bundle does `require('uuid')`. Newer uuid (10+) is
-          #     ESM-only, so the nested resolution would crash at
-          #     runtime with ERR_REQUIRE_ESM. Pinning the nested uuid
-          #     to 8.x (the last CJS-only release) keeps rpc-websockets
-          #     loadable; the hoisted top-level uuid stays at the
-          #     current major so other consumers (e.g. langgraph, which
-          #     needs `v6`) still work.
+          NPM_STAGE="$RUNNER_TEMP/syn-cli-npm-stage"
+          rm -rf "$NPM_STAGE"
+          mkdir -p "$NPM_STAGE"
+          cd "$NPM_STAGE"
+          # Scratch package.json with the rpc-websockets > uuid override.
+          # rpc-websockets's CJS bundle does `require('uuid')`. Newer uuid
+          # (10+) is ESM-only and would crash with ERR_REQUIRE_ESM at
+          # runtime. Pinning the nested uuid to 8.x (last CJS-only
+          # release) keeps rpc-websockets loadable; the hoisted top-level
+          # uuid stays current for langgraph (needs `v6`).
           cat > package.json <<JSON
           {
             "name": "syn-cli-bundle-stage",
@@ -131,18 +132,18 @@ jobs:
             "dependencies": { "@synapseia-network/node": "$VERSION" }
           }
           JSON
-          # Use --ignore-scripts so the CLI's postinstall (patch-package)
-          # doesn't run with cwd = installed-package dir. npm hoists
-          # @libp2p/utils to $STAGE/node_modules/ (not nested under the
-          # CLI), and patch-package run from the package dir can't see
-          # the hoisted dep — fails with "Patch file found for package
-          # utils which is not present at node_modules/@libp2p/utils".
-          # We re-run patch-package manually from the scratch root
-          # below, where it CAN resolve the hoisted layout.
+          # --ignore-scripts so the CLI's postinstall (patch-package) doesn't
+          # run with cwd = installed-package dir. npm hoists @libp2p/utils
+          # to $NPM_STAGE/node_modules/ (not nested under the CLI), and
+          # patch-package run from the package dir can't see the hoisted
+          # dep. We re-run patch-package manually from the scratch root
+          # below where the hoisted layout is visible.
+          #
+          # Once the published CLI's `dist/index.js` is itself pre-bundled
+          # with the patched libp2p source inlined (post 0.8.20), this
+          # step is a no-op — but keep it until we explicitly drop the
+          # patches/ directory from the published tarball.
           npm install --omit=dev --no-audit --no-fund --ignore-scripts
-          # Apply patches from the SCRATCH ROOT so patch-package can
-          # resolve hoisted deps. patch-dir points at the installed
-          # package's patches/ folder.
           PATCH_DIR="node_modules/@synapseia-network/node/patches"
           if [ -d "$PATCH_DIR" ] && [ -n "$(ls -A "$PATCH_DIR" 2>/dev/null)" ]; then
             echo "Applying patches from $PATCH_DIR"
@@ -150,57 +151,46 @@ jobs:
           else
             echo "No patches to apply (patch-dir empty or missing) — continuing."
           fi
-          CLI_DIR="$STAGE/node_modules/@synapseia-network/node"
-          DEST="$GITHUB_WORKSPACE/src-tauri/resources/cli"
-          rm -rf "$DEST"
-          mkdir -p "$DEST"
-          cp -R "$CLI_DIR/dist" "$DEST/"
-          cp "$CLI_DIR/package.json" "$DEST/"
-          # Move the CLI's siblings under node_modules in too (its own deps).
-          # npm hoists dependencies to the top-level node_modules of the
-          # scratch project, so we copy the whole tree minus the CLI's own
-          # entry (the dist/package.json from there is already in DEST).
-          mkdir -p "$DEST/node_modules"
-          # Copy every package except the CLI's own directory.
-          for entry in "$STAGE/node_modules"/*; do
-            name="$(basename "$entry")"
-            if [ "$name" = "@synapseia-network" ]; then
-              # Copy only siblings of `node` under the scope, plus node's
-              # own nested node_modules (its private deps).
-              for scoped in "$entry"/*; do
-                sname="$(basename "$scoped")"
-                if [ "$sname" = "node" ]; then
-                  if [ -d "$scoped/node_modules" ]; then
-                    mkdir -p "$DEST/node_modules/@synapseia-network/node"
-                    cp -R "$scoped/node_modules" "$DEST/node_modules/@synapseia-network/node/"
-                  fi
-                else
-                  mkdir -p "$DEST/node_modules/@synapseia-network"
-                  cp -R "$scoped" "$DEST/node_modules/@synapseia-network/"
-                fi
-              done
-            else
-              cp -R "$entry" "$DEST/node_modules/"
+          CLI_DIR="$NPM_STAGE/node_modules/@synapseia-network/node"
+          STAGE="$GITHUB_WORKSPACE/src-tauri/resources/.cli-bundle-stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/node_modules"
+          # The bundled CLI.
+          cp -R "$CLI_DIR/dist" "$STAGE/"
+          cp "$CLI_DIR/package.json" "$STAGE/"
+          # Native runtime chain. usearch loads `.node` binaries via
+          # dlopen and is `external` in the tsup config; the chain
+          # below is its load-time JS deps. Missing any one crashes the
+          # first KgShardHnswSearcher init with `Cannot find package`.
+          for dep in usearch bindings node-gyp-build node-addon-api file-uri-to-path; do
+            SRC="$NPM_STAGE/node_modules/$dep"
+            if [ ! -d "$SRC" ]; then
+              echo "ERROR: native dep '$dep' missing at $SRC after npm install"
+              exit 1
             fi
+            cp -R "$SRC" "$STAGE/node_modules/"
           done
-          if [ -d "$CLI_DIR/patches" ]; then
-            cp -R "$CLI_DIR/patches" "$DEST/"
-          else
-            mkdir -p "$DEST/patches"
-          fi
           echo "Bundled CLI size (loose tree, pre-tar):"
-          du -sh "$DEST" || true
-          # Tar the entire materialized CLI into ONE opaque archive at
-          # the path Tauri's bundle.resources entry expects. Linux
-          # AppImage's linuxdeploy walks every file under
-          # `resources/cli/node_modules/` (~10k entries including .node
-          # native binaries) and fails silently. A single .tar.gz is
-          # treated as plain data, sidestepping that failure. Pure-Rust
-          # extraction happens at first run in find_synapseia_node.
-          TARBALL="$GITHUB_WORKSPACE/src-tauri/resources/cli-bundle.tar.gz"
-          rm -f "$TARBALL"
-          tar -czf "$TARBALL" -C "$DEST" .
-          rm -rf "$DEST"
+          du -sh "$STAGE" || true
+          # Tar the materialized bundle into ONE opaque archive. Linux
+          # AppImage's linuxdeploy bailed silently when walking the old
+          # ~10k-file node_modules tree; with the slimmer single-bundle
+          # layout the file count is small enough that linuxdeploy
+          # would handle it, but the tarball indirection keeps a stable
+          # extraction model + a deterministic size gate in the Rust
+          # locator (`MIN_REAL_BUNDLE_BYTES`).
+          TARBALL_DIR="$GITHUB_WORKSPACE/src-tauri/resources"
+          mkdir -p "$TARBALL_DIR"
+          rm -f "$TARBALL_DIR/cli-bundle.tar.gz"
+          # cd into the output dir + use a RELATIVE output path so tar
+          # never sees a leading `D:\...` on Windows. With an absolute
+          # path the Windows job otherwise dies with "Cannot connect to
+          # D: resolve failed" because tar parses `D:` as rcp host:path.
+          # macOS BSD tar doesn't support --force-local, so a relative
+          # path is the portable fix.
+          ( cd "$TARBALL_DIR" && tar -czf cli-bundle.tar.gz -C "$STAGE" . )
+          rm -rf "$STAGE"
+          rm -rf "$NPM_STAGE"
           echo "Bundled CLI tarball size:"
           du -sh "$TARBALL" || true
 
