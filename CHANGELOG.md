@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] chore(version): align node-ui to 0.8.16 with coord + node (29fc07e)
+
+Lockstep with `node 0.8.16` (pins `@libp2p/utils@7.1.0` so the
+postinstall `patch-package` step succeeds on fresh installs).
+Node-ui code unchanged from 0.8.15; bumping to keep CI's
+wait-for-npm + bundle pins targeting the patched CLI version.
+
 ## [2026-05-11] fix(bundle): apply patch-package from scratch root (3cc9ea5)
 
 First node-ui-v0.8.15 release run (`25678828203`) failed on the new
