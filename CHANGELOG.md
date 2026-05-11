@@ -1,5 +1,9 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] chore(version): align node-ui to 0.8.13 with node + coord (44040d7)
+
+Lockstep with node 0.8.13. UI code unchanged.
+
 ## [2026-05-11] chore(version): align node-ui to 0.8.12 with node + coord (0b151e0)
 
 Lockstep with node 0.8.12 (WeakMap iteration on the
