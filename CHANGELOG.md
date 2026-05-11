@@ -1,5 +1,22 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] chore(version): align node-ui to 0.8.15 with coord + node (4b564d9)
+
+Lockstep bump. Node-ui code changes in this version cycle:
+- CLI bundling inside the bundle as last-resort fallback (1c23393)
+
+Tag `node-ui-v0.8.15` triggers `release.yml`, which:
+1. Waits up to 10 min for `@synapseia-network/node@0.8.15` on the npm
+   registry.
+2. Runs `npm install --omit=dev @synapseia-network/node@0.8.15` on
+   each platform matrix runner (so the platform-specific `usearch`
+   native binding is correct).
+3. Copies the installed CLI into `src-tauri/resources/cli/` before
+   `tauri-action` builds the DMG/MSI/AppImage.
+
+This guarantees the bundled CLI version inside the desktop bundle
+matches the desktop app version 1:1.
+
 ## [2026-05-11] feat(bundle): ship CLI inside the .dmg/.msi/.AppImage (1c23393)
 
 Closes the recurring "ERR_CLI_MISSING on first launch" failure mode:
