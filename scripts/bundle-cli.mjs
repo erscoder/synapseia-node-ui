@@ -93,7 +93,29 @@ function bundleFromNpm() {
   const stage = join(NODE_UI_ROOT, ".cli-stage");
   rmrf(stage);
   mkdirSync(stage, { recursive: true });
-  execSync("npm init -y", { cwd: stage, stdio: "ignore" });
+  // Write scratch package.json with the `rpc-websockets > uuid`
+  // override BEFORE install so npm applies it. Without this override
+  // the nested rpc-websockets/node_modules/uuid resolves to a 10+/11+
+  // ESM-only build, and rpc-websockets's CJS bundle crashes at
+  // runtime with ERR_REQUIRE_ESM. Pinning the nested uuid to 8.3.2
+  // (last CJS-only release) keeps rpc-websockets loadable; the
+  // hoisted top-level uuid stays current for langgraph (which needs
+  // `v6`). The dependency declaration replaces what `npm init -y`
+  // used to do, so we skip that.
+  writeFileSync(
+    join(stage, "package.json"),
+    JSON.stringify(
+      {
+        name: "syn-cli-bundle-stage",
+        version: "0.0.0",
+        private: true,
+        overrides: { "rpc-websockets": { uuid: "8.3.2" } },
+        dependencies: { "@synapseia-network/node": ownVersion },
+      },
+      null,
+      2,
+    ),
+  );
   // Use --ignore-scripts so the CLI's postinstall (patch-package)
   // doesn't run with cwd = installed-package dir. npm hoists
   // @libp2p/utils to the scratch root's node_modules (not nested under
@@ -101,7 +123,7 @@ function bundleFromNpm() {
   // hoisted dep. We re-run patch-package manually below from the
   // scratch root, where the hoisted layout is visible.
   execSync(
-    `npm install --omit=dev --no-audit --no-fund --ignore-scripts @synapseia-network/node@${ownVersion}`,
+    "npm install --omit=dev --no-audit --no-fund --ignore-scripts",
     { cwd: stage, stdio: "inherit" },
   );
   const cliDir = join(stage, "node_modules", "@synapseia-network", "node");

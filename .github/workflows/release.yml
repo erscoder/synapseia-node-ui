@@ -109,7 +109,28 @@ jobs:
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
           cd "$STAGE"
-          npm init -y >/dev/null
+          # Write scratch package.json with overrides BEFORE install so
+          # npm can apply them. Two overrides matter at install time:
+          #
+          #  1. `rpc-websockets > uuid: 8.3.2` — rpc-websockets's
+          #     CJS bundle does `require('uuid')`. Newer uuid (10+) is
+          #     ESM-only, so the nested resolution would crash at
+          #     runtime with ERR_REQUIRE_ESM. Pinning the nested uuid
+          #     to 8.x (the last CJS-only release) keeps rpc-websockets
+          #     loadable; the hoisted top-level uuid stays at the
+          #     current major so other consumers (e.g. langgraph, which
+          #     needs `v6`) still work.
+          cat > package.json <<JSON
+          {
+            "name": "syn-cli-bundle-stage",
+            "version": "0.0.0",
+            "private": true,
+            "overrides": {
+              "rpc-websockets": { "uuid": "8.3.2" }
+            },
+            "dependencies": { "@synapseia-network/node": "$VERSION" }
+          }
+          JSON
           # Use --ignore-scripts so the CLI's postinstall (patch-package)
           # doesn't run with cwd = installed-package dir. npm hoists
           # @libp2p/utils to $STAGE/node_modules/ (not nested under the
@@ -118,7 +139,7 @@ jobs:
           # utils which is not present at node_modules/@libp2p/utils".
           # We re-run patch-package manually from the scratch root
           # below, where it CAN resolve the hoisted layout.
-          npm install --omit=dev --no-audit --no-fund --ignore-scripts "@synapseia-network/node@$VERSION"
+          npm install --omit=dev --no-audit --no-fund --ignore-scripts
           # Apply patches from the SCRATCH ROOT so patch-package can
           # resolve hoisted deps. patch-dir points at the installed
           # package's patches/ folder.
