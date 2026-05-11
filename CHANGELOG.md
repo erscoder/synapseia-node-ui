@@ -1,5 +1,29 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-11] fix(bundle): apply patch-package from scratch root (3cc9ea5)
+
+First node-ui-v0.8.15 release run (`25678828203`) failed on the new
+CI bundle step:
+
+```
+Error: Patch file found for package utils which is not present at
+node_modules/@libp2p/utils
+```
+
+Root cause: `npm install --omit=dev @synapseia-network/node` hoists
+`@libp2p/utils` to the scratch root's `node_modules/`, but the
+postinstall `patch-package` runs with cwd at
+`scratch/node_modules/@synapseia-network/node/` and looks for
+`./node_modules/@libp2p/utils` nested — which doesn't exist.
+
+Fix: install with `--ignore-scripts` so the postinstall is skipped,
+then run `patch-package@8` manually from the scratch root pointing
+`--patch-dir` at the installed package's `patches/` subdir.
+
+Applied to both `release.yml` (CI per-platform build) and
+`scripts/bundle-cli.mjs::bundleFromNpm()` (local materializer).
+The `bundleFromWorkspace` mode is unaffected.
+
 ## [2026-05-11] chore(version): align node-ui to 0.8.15 with coord + node (4b564d9)
 
 Lockstep bump. Node-ui code changes in this version cycle:
