@@ -22,6 +22,7 @@ import {
   cpSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,11 +94,32 @@ function bundleFromNpm() {
   rmrf(stage);
   mkdirSync(stage, { recursive: true });
   execSync("npm init -y", { cwd: stage, stdio: "ignore" });
+  // Use --ignore-scripts so the CLI's postinstall (patch-package)
+  // doesn't run with cwd = installed-package dir. npm hoists
+  // @libp2p/utils to the scratch root's node_modules (not nested under
+  // the CLI), and patch-package run from the package dir can't see the
+  // hoisted dep. We re-run patch-package manually below from the
+  // scratch root, where the hoisted layout is visible.
   execSync(
-    `npm install --omit=dev --no-audit --no-fund @synapseia-network/node@${ownVersion}`,
+    `npm install --omit=dev --no-audit --no-fund --ignore-scripts @synapseia-network/node@${ownVersion}`,
     { cwd: stage, stdio: "inherit" },
   );
   const cliDir = join(stage, "node_modules", "@synapseia-network", "node");
+  // Apply patches from the scratch root so patch-package can resolve
+  // hoisted deps. patch-dir points at the installed package's patches/.
+  const patchesDir = join(cliDir, "patches");
+  if (
+    existsSync(patchesDir) &&
+    readdirSync(patchesDir).filter((f) => f.endsWith(".patch")).length > 0
+  ) {
+    const relPatchDir = join("node_modules", "@synapseia-network", "node", "patches");
+    execSync(
+      `npx --yes patch-package@8 --patch-dir "${relPatchDir}" --error-on-fail`,
+      { cwd: stage, stdio: "inherit" },
+    );
+  } else {
+    console.log("[bundle-cli] no patches to apply (empty or missing)");
+  }
   rmrf(DEST);
   mkdirSync(DEST, { recursive: true });
   cpSync(join(cliDir, "dist"), join(DEST, "dist"), { recursive: true });

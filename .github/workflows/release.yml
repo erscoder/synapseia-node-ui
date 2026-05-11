@@ -106,7 +106,25 @@ jobs:
           mkdir -p "$STAGE"
           cd "$STAGE"
           npm init -y >/dev/null
-          npm install --omit=dev --no-audit --no-fund "@synapseia-network/node@$VERSION"
+          # Use --ignore-scripts so the CLI's postinstall (patch-package)
+          # doesn't run with cwd = installed-package dir. npm hoists
+          # @libp2p/utils to $STAGE/node_modules/ (not nested under the
+          # CLI), and patch-package run from the package dir can't see
+          # the hoisted dep — fails with "Patch file found for package
+          # utils which is not present at node_modules/@libp2p/utils".
+          # We re-run patch-package manually from the scratch root
+          # below, where it CAN resolve the hoisted layout.
+          npm install --omit=dev --no-audit --no-fund --ignore-scripts "@synapseia-network/node@$VERSION"
+          # Apply patches from the SCRATCH ROOT so patch-package can
+          # resolve hoisted deps. patch-dir points at the installed
+          # package's patches/ folder.
+          PATCH_DIR="node_modules/@synapseia-network/node/patches"
+          if [ -d "$PATCH_DIR" ] && [ -n "$(ls -A "$PATCH_DIR" 2>/dev/null)" ]; then
+            echo "Applying patches from $PATCH_DIR"
+            npx --yes patch-package@8 --patch-dir "$PATCH_DIR" --error-on-fail
+          else
+            echo "No patches to apply (patch-dir empty or missing) — continuing."
+          fi
           CLI_DIR="$STAGE/node_modules/@synapseia-network/node"
           DEST="$GITHUB_WORKSPACE/src-tauri/resources/cli"
           rm -rf "$DEST"
