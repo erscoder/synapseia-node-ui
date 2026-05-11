@@ -36,7 +36,11 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # libfuse2: linuxdeploy is itself an AppImage and needs FUSE2 to
+          # self-mount at build time. The ubuntu-22.04 GitHub runner stopped
+          # pre-installing libfuse2; without it the AppImage bundling step
+          # exits with "failed to run linuxdeploy" and no stderr.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
 
       - uses: actions/setup-node@v5
         with:
