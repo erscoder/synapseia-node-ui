@@ -17,19 +17,67 @@ interface Props {
   onRefresh: () => Promise<void>;
 }
 
-// Mirrors `packages/dashboard/app/my-node/page.tsx`. Each reward type gets a
-// label + accent colour so the breakdown rows read as a legend.
-const TYPE_LABELS: Record<string, { label: string; color: string }> = {
-  research: { label: "Research Wins", color: "text-amber-400" },
-  training: { label: "Training Wins", color: "text-cyan-400" },
-  evaluation: { label: "Peer Review", color: "text-violet-400" },
-  cpu_inference: { label: "CPU Inference", color: "text-teal-400" },
-  gpu_inference: { label: "GPU Inference", color: "text-pink-400" },
-  diloco: { label: "DiLoCo", color: "text-orange-400" },
-  staking: { label: "Staking", color: "text-emerald-400" },
-  work_order: { label: "Work Orders", color: "text-blue-400" },
-  docking: { label: "Molecular Docking", color: "text-fuchsia-400" },
-};
+// Aggregated reward groups for the breakdown UI. Each group sums one or more
+// backend RewardType keys (see packages/coordinator/src/domain/entities/Reward.ts).
+// `order` controls render order; lower first. Mirrors the dashboard
+// `packages/dashboard/app/(app)/my-node/page.tsx` Rewards card 1:1 so operators
+// see the same semantic groups across web and desktop.
+const REWARD_GROUPS: ReadonlyArray<{
+  label: string;
+  color: string;
+  order: number;
+  keys: ReadonlyArray<string>;
+}> = [
+  { label: "Research Wins",     color: "text-amber-400",   order: 1, keys: ["research"] },
+  { label: "Training Rewards",  color: "text-cyan-400",    order: 2, keys: ["training", "diloco", "lora", "docking"] },
+  { label: "Inference Rewards", color: "text-purple-400",  order: 3, keys: ["cpu_inference", "gpu_inference"] },
+  { label: "Peer Review",       color: "text-violet-400",  order: 4, keys: ["evaluation"] },
+  { label: "Work Orders",       color: "text-blue-400",    order: 5, keys: ["work_order"] },
+];
+
+// Backend RewardType keys that are intentionally NOT shown on the per-node
+// Rewards card. They are "known-but-handled-elsewhere" — distinct from unknown
+// keys (which fall through to the gray fallback row).
+//
+// - `staking`: staking rewards live in the dashboard at
+//   `app.synapseia.network/staking`. The desktop app intentionally omits a
+//   staking surface — surfacing the rewards here without the stake/unstake
+//   flow would imply they accrue locally. Operators manage staking from the
+//   web dashboard.
+// - `referral`: `RewardType.REFERRAL` exists in the coordinator enum but no
+//   code path actually emits it today. Rendering an always-zero row (or a
+//   stray non-zero row from a future experiment) would imply a feature that
+//   isn't shipped. Re-add the group here only when the referral flow is live.
+const EXCLUDED_KEYS = new Set<string>(["staking", "referral"]);
+
+// All keys covered by a known group. Any byType key NOT in this set AND NOT
+// in EXCLUDED_KEYS renders as a gray fallback row so future RewardType
+// additions in the coordinator don't silently disappear from the UI.
+const KNOWN_REWARD_KEYS = new Set<string>(REWARD_GROUPS.flatMap((g) => g.keys));
+
+function humanizeKey(key: string): string {
+  return key
+    .split("_")
+    .map((part) => (part.length === 0 ? part : part[0].toUpperCase() + part.slice(1)))
+    .join(" ");
+}
+
+// `byType` values arrive as numbers from the Tauri ChainInfo bridge (unlike the
+// web dashboard which uses string-encoded amounts). Accept both shapes so the
+// helper stays drop-in if the bridge ever flips to strings.
+function sumKeys(
+  byType: Record<string, number | string>,
+  keys: ReadonlyArray<string>,
+): number {
+  let total = 0;
+  for (const k of keys) {
+    const raw = byType[k];
+    if (raw === undefined || raw === null) continue;
+    const n = typeof raw === "number" ? raw : parseFloat(raw);
+    if (Number.isFinite(n)) total += n;
+  }
+  return total;
+}
 
 function formatSyn(n: number): string {
   if (!Number.isFinite(n) || n === 0) return "0";
@@ -129,7 +177,6 @@ export function MyNodePanel({
   const claimable = recentlyClaimed ? 0 : chainInfo?.vaultClaimableSyn ?? 0;
   const totalClaimed = chainInfo?.totalClaimedSyn ?? 0;
   const byType = recentlyClaimed ? {} : chainInfo?.rewardsByType ?? {};
-  const hasBreakdown = Object.keys(byType).length > 0;
 
   return (
     <div className="space-y-6">
@@ -280,27 +327,63 @@ export function MyNodePanel({
           )}
         </div>
 
-        {/* Breakdown by type */}
+        {/* Breakdown by aggregated group. Hide groups whose sum is zero so the
+            card stays focused on what the node actually earned. Unknown
+            backend keys fall through to a gray fallback row. */}
         <div className="space-y-2">
-          {Object.entries(byType).map(([type, amount]) => {
-            const meta = TYPE_LABELS[type] ?? { label: type, color: "text-slate-400" };
+          {(() => {
+            const visibleGroups = REWARD_GROUPS
+              .map((g) => ({ ...g, total: sumKeys(byType, g.keys) }))
+              .filter((g) => g.total > 0)
+              .sort((a, b) => a.order - b.order);
+
+            const fallbackRows = Object.entries(byType)
+              .filter(([key, amount]) => {
+                if (KNOWN_REWARD_KEYS.has(key) || EXCLUDED_KEYS.has(key)) return false;
+                const n = typeof amount === "number" ? amount : parseFloat(amount);
+                return Number.isFinite(n) && n > 0;
+              })
+              .map(([key, amount]) => ({
+                key,
+                label: humanizeKey(key),
+                color: "text-slate-400",
+                total: typeof amount === "number" ? amount : parseFloat(amount) || 0,
+              }));
+
+            const hasAnyRow = visibleGroups.length > 0 || fallbackRows.length > 0;
+
             return (
-              <div
-                key={type}
-                className="flex items-center justify-between py-2 px-3 rounded bg-white/[0.02]"
-              >
-                <span className={`text-sm ${meta.color}`}>{meta.label}</span>
-                <span className="text-sm font-mono text-slate-100">
-                  {formatSyn(amount)} SYN
-                </span>
-              </div>
+              <>
+                {visibleGroups.map((g) => (
+                  <div
+                    key={g.label}
+                    className="flex items-center justify-between py-2 px-3 rounded bg-white/[0.02]"
+                  >
+                    <span className={`text-sm ${g.color}`}>{g.label}</span>
+                    <span className="text-sm font-mono text-slate-100">
+                      {formatSyn(g.total)} SYN
+                    </span>
+                  </div>
+                ))}
+                {fallbackRows.map((r) => (
+                  <div
+                    key={r.key}
+                    className="flex items-center justify-between py-2 px-3 rounded bg-white/[0.02]"
+                  >
+                    <span className={`text-sm ${r.color}`}>{r.label}</span>
+                    <span className="text-sm font-mono text-slate-100">
+                      {formatSyn(r.total)} SYN
+                    </span>
+                  </div>
+                ))}
+                {!hasAnyRow && claimable === 0 && (
+                  <p className="text-xs text-slate-600 text-center py-4">
+                    No rewards yet — start running your node!
+                  </p>
+                )}
+              </>
             );
-          })}
-          {!hasBreakdown && claimable === 0 && (
-            <p className="text-xs text-slate-600 text-center py-4">
-              No rewards yet — start running your node!
-            </p>
-          )}
+          })()}
         </div>
       </Card>
 
