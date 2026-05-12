@@ -1,5 +1,33 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-12] ui(my-node-panel): mirror dashboard Rewards card refactor (5141c77)
+
+Brings the desktop app's `MyNodePanel` Rewards breakdown to behavior
+parity with the web dashboard `/my-node` page shipped earlier this
+cycle.
+
+Aggregated 5-group breakdown (Research / Training (training + diloco
++ lora + docking) / Inference (cpu_inference + gpu_inference,
+purple-400 new) / Peer Review / Work Orders). Zero-sum groups hidden.
+`EXCLUDED_KEYS = {staking, referral}` so staking rewards aren't
+double-counted (operators manage staking from
+`app.synapseia.network/staking`; the desktop app intentionally has
+no staking surface) and the never-emitted `referral` type doesn't
+render a phantom row. Unknown future RewardType keys fall through to
+a slate-400 fallback row.
+
+Node-ui-specific deviations from the dashboard pattern: keeps the
+`!hasAnyRow && claimable === 0` empty-state condition (original
+desktop UX for fresh nodes) and the `recentlyClaimed` optimistic-
+clear flow.
+
+Reviewer SHIP after fixing a P10 JSDoc lie — original draft said
+staking lives "in the Staking section of the dashboard" which is
+false from the desktop app's POV; rewrite points operators at the
+web dashboard URL.
+
+File: `src/components/MyNodePanel.tsx` (~+40 LOC net).
+
 ## [2026-05-11] chore(version): align node-ui to 0.8.17 + Linux AppImage fix (765bfef)
 
 Lockstep bump. Pairs with `fix(ci): install libfuse2 for AppImage
