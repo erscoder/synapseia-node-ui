@@ -208,6 +208,97 @@ pub async fn wallet_exists() -> Result<WalletExists, String> {
     })
 }
 
+// ─── UI-only settings (Ollama endpoint override, etc.) ────────────────────────
+//
+// These are NOT persisted in the node CLI's config.json on purpose: the node
+// CLI honors the `OLLAMA_URL` env var across embeddings, hardware, ollama,
+// and training-llm modules, so the desktop UI persists the override locally
+// and injects it as an env var whenever it spawns the CLI. Keeps the CLI
+// surface unchanged and avoids fighting the deprecated `--llm-url` flag.
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct UiSettings {
+    /// Empty string means "use the built-in default
+    /// (http://localhost:11434)" — never persisted as a literal fallback.
+    #[serde(default, rename = "ollamaUrl")]
+    pub ollama_url: String,
+}
+
+fn ui_settings_path() -> PathBuf {
+    synapseia_home().join("ui-settings.json")
+}
+
+fn read_ui_settings_raw() -> UiSettings {
+    let path = ui_settings_path();
+    if !path.exists() {
+        return UiSettings::default();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<UiSettings>(&raw).unwrap_or_default(),
+        Err(_) => UiSettings::default(),
+    }
+}
+
+fn write_ui_settings_raw(settings: &UiSettings) -> Result<(), String> {
+    let home = synapseia_home();
+    if !home.exists() {
+        std::fs::create_dir_all(&home).map_err(|e| {
+            format!(
+                "failed to create {}: {}",
+                home.to_string_lossy(),
+                e
+            )
+        })?;
+    }
+    let path = ui_settings_path();
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("failed to serialize ui-settings: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| {
+        format!(
+            "failed to write {}: {}",
+            path.to_string_lossy(),
+            e
+        )
+    })
+}
+
+/// Trim + reject empty strings so callers never push a whitespace-only env var
+/// into the spawned CLI.
+fn normalized_ollama_url() -> Option<String> {
+    let raw = read_ui_settings_raw().ollama_url;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn get_ui_settings() -> Result<UiSettings, String> {
+    Ok(read_ui_settings_raw())
+}
+
+#[tauri::command]
+pub async fn set_ui_settings(ollama_url: String) -> Result<UiSettings, String> {
+    let trimmed = ollama_url.trim();
+    // Soft URL shape validation here mirrors the JS-side check so a malformed
+    // value can't sneak in via a direct invoke() call from devtools.
+    if !trimmed.is_empty() {
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            return Err("Ollama URL must start with http:// or https://".to_string());
+        }
+        if trimmed.ends_with('/') {
+            return Err("Ollama URL must not end with a trailing slash".to_string());
+        }
+    }
+    let next = UiSettings {
+        ollama_url: trimmed.to_string(),
+    };
+    write_ui_settings_raw(&next)?;
+    Ok(next)
+}
+
 /// Hardware introspection without spawning anything. Uses the `sysinfo`
 /// crate directly so the SystemPanel is instant — no CLI bootstrap, no
 /// coordinator round trip. GPU detection is macOS-specific via `system_profiler`.
@@ -1033,6 +1124,14 @@ fn build_node_command(app: Option<&AppHandle>, args: &[&str]) -> Result<Command,
         augmented_path()
     };
     cmd.env("PATH", path_env);
+    // Forward the operator-configured Ollama endpoint (set via the desktop
+    // Settings panel) into every spawned CLI invocation. Empty / unset =
+    // CLI falls through to its hardcoded default (http://localhost:11434).
+    // The CLI reads `OLLAMA_URL` across embeddings, hardware probe, ollama
+    // chat, and training-llm.
+    if let Some(url) = normalized_ollama_url() {
+        cmd.env("OLLAMA_URL", url);
+    }
     Ok(cmd)
 }
 

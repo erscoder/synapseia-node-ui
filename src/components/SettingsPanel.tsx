@@ -24,6 +24,14 @@ interface ConfigState {
   llmKey: string;
   inferenceEnabled: boolean;
   inferenceModels: string;
+  /**
+   * Optional override for the local Ollama endpoint. Empty string ("") means
+   * "use the CLI's hardcoded default (http://localhost:11434)" — it is NEVER
+   * persisted as a literal fallback. Stored separately from the node CLI's
+   * `config.json` (Tauri-side `~/.synapseia/ui-settings.json`); injected into
+   * spawned CLI invocations as the `OLLAMA_URL` env var.
+   */
+  ollamaUrl: string;
 }
 
 const DEFAULT_CONFIG: ConfigState = {
@@ -32,7 +40,20 @@ const DEFAULT_CONFIG: ConfigState = {
   llmKey: "",
   inferenceEnabled: false,
   inferenceModels: "",
+  ollamaUrl: "",
 };
+
+/**
+ * Soft URL shape validation. Empty string is "use default" (valid).
+ * Must start with http(s):// and must NOT end with a trailing slash.
+ */
+function isValidOllamaUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed === "") return true;
+  if (!/^https?:\/\//i.test(trimmed)) return false;
+  if (trimmed.endsWith("/")) return false;
+  return true;
+}
 
 // The CLI prefixes every logger.log line with an ANSI timestamp + level
 // (e.g. `\x1b[90m02:10:58.241\x1b[0m  \x1b[32mINFO\x1b[0m  <msg>`). The
@@ -122,6 +143,17 @@ export function SettingsPanel({ password }: Props) {
       setSelection(selectionFromSlug(slug));
       const storedKey = typeof parsed.llmKey === "string" ? parsed.llmKey : "";
       setHasStoredKey(storedKey.length > 0);
+      // Fetch the Tauri-side UI settings (Ollama endpoint override) in
+      // parallel. A failure here is non-fatal: we just fall back to the
+      // empty string ("use default") and let the operator retype it.
+      let ollamaUrl = "";
+      try {
+        const ui = await invoke<{ ollamaUrl?: string }>("get_ui_settings");
+        if (ui && typeof ui.ollamaUrl === "string") ollamaUrl = ui.ollamaUrl;
+      } catch {
+        // Ignore — older Tauri builds without the command should not block
+        // the rest of the config from loading.
+      }
       setConfig({
         name: (parsed.name as string) ?? "",
         defaultModel: slug,
@@ -130,6 +162,7 @@ export function SettingsPanel({ password }: Props) {
         inferenceModels: Array.isArray(parsed.inferenceModels)
           ? (parsed.inferenceModels as string[]).join(", ")
           : "",
+        ollamaUrl,
       });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -145,6 +178,15 @@ export function SettingsPanel({ password }: Props) {
 
   const saveConfig = async () => {
     if (!password) return;
+    // Block save when the operator-typed Ollama URL is malformed; the same
+    // shape check runs Rust-side as a defense in depth, but failing fast
+    // here gives a clearer in-UI error.
+    if (!isValidOllamaUrl(config.ollamaUrl)) {
+      setError(
+        "Invalid Ollama endpoint. Must start with http:// or https:// and have no trailing slash.",
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     setSuccess(null);
@@ -166,6 +208,12 @@ export function SettingsPanel({ password }: Props) {
           password,
         });
       }
+
+      // Persist the Ollama endpoint override via the Tauri-side store. Empty
+      // string is intentionally preserved as "use default" — Rust trims and
+      // skips the env var when blank. We always send the call so that
+      // clearing the field overwrites a previously saved value.
+      await invoke("set_ui_settings", { ollamaUrl: config.ollamaUrl.trim() });
 
       setSuccess("Config saved successfully");
       await loadConfig();
@@ -310,7 +358,11 @@ export function SettingsPanel({ password }: Props) {
                 <option key={p.id} value={p.id}>{p.label}</option>
               ))}
             </select>
-            <p className="text-xs text-slate-500">Endpoint is hardcoded per provider.</p>
+            <p className="text-xs text-slate-500">
+              {selection.kind === "ollama"
+                ? "Endpoint is editable below."
+                : "Cloud endpoints are hardcoded per provider."}
+            </p>
           </div>
           <div className="space-y-1.5">
             <label className="block text-xs uppercase tracking-wide text-slate-400">
@@ -323,6 +375,27 @@ export function SettingsPanel({ password }: Props) {
                 : "Top = strongest, Mid = balanced, Budget = fastest/cheapest."}
             </p>
           </div>
+          {selection.kind === "ollama" && (
+            <div className="md:col-span-2 space-y-1.5">
+              <label className="block text-xs uppercase tracking-wide text-slate-400">Endpoint</label>
+              <input
+                type="text"
+                value={config.ollamaUrl}
+                onChange={(e) => updateField("ollamaUrl", e.target.value)}
+                placeholder="http://localhost:11434"
+                className={`w-full px-4 py-2.5 bg-[var(--bg-elevated)]/80 backdrop-blur-sm border rounded-lg text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 transition-all font-mono ${
+                  isValidOllamaUrl(config.ollamaUrl)
+                    ? "border-white/[0.06] focus:border-[var(--accent-purple)]/60 focus:ring-[var(--accent-purple)]/20"
+                    : "border-red-500/60 focus:border-red-500/80 focus:ring-red-500/30"
+                }`}
+              />
+              <p className={`text-xs ${isValidOllamaUrl(config.ollamaUrl) ? "text-slate-500" : "text-red-300"}`}>
+                {isValidOllamaUrl(config.ollamaUrl)
+                  ? "Leave blank for the default. Use this to point at a Docker container or remote host (e.g. http://localhost:11435)."
+                  : "Must start with http:// or https:// and must not end with a trailing slash."}
+              </p>
+            </div>
+          )}
           {selection.kind === "cloud" && (
             <div className="md:col-span-2 space-y-1.5">
               <label className="block text-xs uppercase tracking-wide text-slate-400">LLM API Key</label>
