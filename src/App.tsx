@@ -75,6 +75,10 @@ export interface ChainInfo {
   attestationFailures: number;
   tier: number | null;
   nodeName: string | null;
+  // Optional: coord derives this server-side from `createdAt < BETA_SNAPSHOT_TS`.
+  // Older coord versions don't ship the field, so the desktop treats `undefined`
+  // as "not a beta tester" instead of breaking the UI.
+  isBetaTester?: boolean;
 }
 
 type BootPhase = "checking" | "needs-create" | "needs-unlock" | "unlocked" | "needs-activation" | "installing-node";

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ChainInfo, CommandResult, NodeStatus } from "../App";
 import {
   Monitor, Trophy, Shield, Coins, Activity, RefreshCw, Play, Square, Terminal,
-  CheckCircle2, AlertTriangle, XCircle, Star, Loader2,
+  CheckCircle2, AlertTriangle, XCircle, Star, Loader2, Sparkles,
 } from "lucide-react";
 import { Card, Button, PageHeader } from "./ui";
 
@@ -185,6 +185,7 @@ export function MyNodePanel({
         subtitle="Your node identity, rewards, and health"
         action={
           <>
+            {chainInfo?.isBetaTester && <BetaBadge />}
             {status.running ? (
               <Button variant="danger" onClick={onStop}>
                 <Square className="w-4 h-4" />
@@ -460,6 +461,21 @@ function StatCard({
       <div className={`text-3xl font-bold font-mono ${valueClass}`}>{value}</div>
       <span className="text-[10px] text-slate-600">{sub}</span>
     </Card>
+  );
+}
+
+// Displayed only when the coord-side eligibility check flags the operator as a
+// pre-mainnet beta tester. Purely informational — no claim flow lives here yet.
+// Mirrors the dashboard `BetaBadge` 1:1 so web + desktop stay visually consistent.
+function BetaBadge() {
+  return (
+    <span
+      title="Joined before mainnet — eligible for the upcoming SYN airdrop snapshot."
+      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-medium self-center"
+    >
+      <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+      Beta Tester
+    </span>
   );
 }
 
