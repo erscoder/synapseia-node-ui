@@ -1,5 +1,28 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] fix(tauri): strip bigint-buffer warning from captured CLI stderr (6c55563)
+
+Defense-in-depth complement to the node CLI fix shipped in node
+0.8.38. The `bigint-buffer` load warning emitted by a transitive
+Solana web3.js dependency leaked into the SettingsPanel toast on
+Windows because Node's pipe-stderr path bypassed the CLI-side
+`process.stderr.write` filter. The CLI now catches the warning at
+its `console.warn` source, but we strip it again Rust-side as a
+backstop so any future warning emitters hitting the same surface
+stay out of the user-facing toast.
+
+New `strip_known_noise(buf: &str) -> String` helper drops every
+line containing `bigint: Failed to load bindings, pure JS will be
+used`. Applied at the four stderr capture sites that flow into
+user-facing output: `run_command`, `unlock_wallet`,
+`create_wallet`, and the `chain-info` verification.
+
+4 cargo unit tests cover happy-path, unrelated-line preservation,
+empty buffer, and all-noise buffer.
+
+Version: 0.8.37 -> 0.8.38 (lockstep with coord + node CLI fix).
+
+
 ## [2026-05-14] chore(release): 0.8.37 lockstep bump for node multi-slash slug fix (e8f6a8b)
 
 Version-only bump. Node-ui has no functional change in this cycle.
