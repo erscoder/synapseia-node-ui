@@ -139,21 +139,43 @@ export function SettingsPanel({ password }: Props) {
         setError(`Could not parse config output.\n\n${res.output.slice(0, 400)}`);
         return;
       }
-      const slug = (parsed.defaultModel as string) ?? DEFAULT_CONFIG.defaultModel;
-      setSelection(selectionFromSlug(slug));
-      const storedKey = typeof parsed.llmKey === "string" ? parsed.llmKey : "";
-      setHasStoredKey(storedKey.length > 0);
-      // Fetch the Tauri-side UI settings (Ollama endpoint override) in
-      // parallel. A failure here is non-fatal: we just fall back to the
-      // empty string ("use default") and let the operator retype it.
+      const cliKey = typeof parsed.llmKey === "string" ? parsed.llmKey : "";
+      // Fetch the Tauri-side UI settings (Ollama endpoint + persisted cloud
+      // selection) so the panel can reconstruct the operator's last save
+      // even when the CLI side of the config is missing fields. A failure
+      // here is non-fatal: we fall back to whatever the CLI returned.
       let ollamaUrl = "";
+      let tauriApiKey = "";
+      let tauriSlug = "";
       try {
-        const ui = await invoke<{ ollamaUrl?: string }>("get_ui_settings");
+        const ui = await invoke<{
+          ollamaUrl?: string;
+          llmApiKey?: string;
+          llmModelSlug?: string;
+        }>("get_ui_settings");
         if (ui && typeof ui.ollamaUrl === "string") ollamaUrl = ui.ollamaUrl;
+        if (ui && typeof ui.llmApiKey === "string") tauriApiKey = ui.llmApiKey;
+        if (ui && typeof ui.llmModelSlug === "string") tauriSlug = ui.llmModelSlug;
       } catch {
         // Ignore — older Tauri builds without the command should not block
         // the rest of the config from loading.
       }
+      // Slug preference: CLI's defaultModel is canonical, but if it's the
+      // hardcoded fallback AND Tauri has a richer persisted slug (e.g. the
+      // operator picked NVIDIA NIM but the CLI never received --set-model
+      // because of an earlier save failure), trust the Tauri value so the
+      // dropdowns reflect what the operator actually picked.
+      const cliSlug = (parsed.defaultModel as string) ?? "";
+      const slug = cliSlug && cliSlug !== DEFAULT_CONFIG.defaultModel
+        ? cliSlug
+        : tauriSlug || cliSlug || DEFAULT_CONFIG.defaultModel;
+      setSelection(selectionFromSlug(slug));
+      // Stored-key preference: prefer the CLI's real value (so the eye toggle
+      // can reveal it), but if the CLI doesn't have one and the Tauri side
+      // does, use the `__STORED__` sentinel so the dots still display and
+      // the save path correctly skips re-sending the stored value.
+      const storedKey = cliKey || (tauriApiKey ? "__STORED__" : "");
+      setHasStoredKey(storedKey.length > 0);
       setConfig({
         name: (parsed.name as string) ?? "",
         defaultModel: slug,
