@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] chore(release): 0.8.42 lockstep bump for node banner ASCII fix (f5ffda3)
+
+Version-only bump. Node-ui has no functional change in this
+cycle. Node 0.8.42 replaces the heavy-block boot banner with a
+plain-ASCII header so it renders correctly in this app's log
+viewer. Lockstep keeps coord + node + node-ui versioned
+together.
+
+
 ## [2026-05-14] feat(ui+tauri): start/stop button in Logs + auto-respawn on self-update (c898517)
 
 Two operator-experience improvements:
