@@ -1,5 +1,35 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] feat(ui+tauri): start/stop button in Logs + auto-respawn on self-update (c898517)
+
+Two operator-experience improvements:
+
+1. **Start/Stop in LogsPanel** — operators no longer have to
+   switch to My Node to control the node. `LogViewer` now
+   receives the App-level `nodeStatus` + `password` +
+   `handleStart`/`handleStop` props and renders the same toggle
+   button next to Export. Single source of truth (App state) so
+   the two views never diverge. 4 new vitest specs cover Start
+   render + click, Stop render + click, disabled-when-locked, and
+   Export-still-visible.
+
+2. **Auto-respawn after self-update** — the CLI's
+   `[SELF_UPDATE_RESTART]` stdout cue is now detected by the
+   Tauri-side stdout streamer. On child EOF after the cue,
+   Tauri reuses the cached wallet password to spawn the new CLI
+   version automatically and emits `node-self-update-restarted`
+   so the UI can show a toast. New `generation: u64` counter on
+   `NodeProcess` guards against stale EOF watchers racing with a
+   manual stop+start. If the wallet password is no longer
+   cached (lock between updates) Tauri emits
+   `node-self-update-restart-failed` with an actionable error
+   message instead of failing silently. 4 new
+   `self_update_tests` in `commands.rs` covering the cue parser
+   and the latch/reset paths.
+
+Version: 0.8.40 -> 0.8.41 (lockstep with coord + node).
+
+
 ## [2026-05-14] fix(tauri): spawn dist/bootstrap.js to enable bigint warning filter (356cec8)
 
 Bug: the `bigint-buffer` console.warn / `process.stderr.write`
