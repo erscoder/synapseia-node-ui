@@ -527,7 +527,7 @@ pub async fn fetch_chain_info(app: AppHandle) -> Result<ChainInfo, String> {
         }
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = strip_known_noise(&String::from_utf8_lossy(&output.stderr));
     Err(format!(
         "chain-info produced no __CHAIN_INFO__ line (stderr: {})",
         stderr.lines().last().unwrap_or("<empty>")
@@ -705,7 +705,7 @@ pub async fn unlock_wallet(app: AppHandle, password: String) -> Result<UnlockRes
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr = strip_known_noise(&String::from_utf8_lossy(&output.stderr));
     let combined = format!("{}\n{}", stdout, stderr);
     eprintln!(
         "[synapseia-node-ui] unlock_wallet exit={:?} stdout={:?} stderr={:?}",
@@ -842,7 +842,7 @@ pub async fn create_wallet(
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr = strip_known_noise(&String::from_utf8_lossy(&output.stderr));
     let combined = format!("{}\n{}", stdout, stderr);
     eprintln!(
         "[synapseia-node-ui] create_wallet exit={:?} stdout={:?} stderr={:?}",
@@ -1157,7 +1157,7 @@ pub async fn run_command(
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr = strip_known_noise(&String::from_utf8_lossy(&output.stderr));
 
     if output.status.success() {
         Ok(CommandResult {
@@ -1894,6 +1894,20 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     }
 }
 
+/// Strip lines containing well-known transitive-dependency warnings from a
+/// captured CLI stderr buffer. Currently filters:
+///   - `bigint: Failed to load bindings, pure JS will be used` — emitted by
+///     `bigint-buffer` (transitive dep of @solana/web3.js) when its native
+///     binding can't load (the pure-JS fallback works correctly). The
+///     CLI's bootstrap.ts already filters this in-process but on Windows
+///     piped-stderr the in-process filter sometimes leaks.
+fn strip_known_noise(buf: &str) -> String {
+    buf.lines()
+        .filter(|line| !line.contains("bigint: Failed to load bindings, pure JS will be used"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn extract_pubkey(s: &str) -> Option<String> {
     // CLI emits `__WALLET_OK__ <pubkey>` on success. The sentinel is
     // intentionally distinct so grep/regex on logs can't yield a false match.
@@ -2287,5 +2301,37 @@ mod tests {
         );
         // No <PROVIDER>_API_KEY entry should be emitted.
         assert!(map.keys().all(|k| !k.ends_with("_API_KEY")));
+    }
+}
+
+#[cfg(test)]
+mod strip_known_noise_tests {
+    use super::strip_known_noise;
+
+    #[test]
+    fn filters_bigint_warning_line() {
+        let input = "bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)\n\
+                     ❌ Invalid model format. Got: nvidia/meta/llama-3.3-70b-instruct";
+        let out = strip_known_noise(input);
+        assert!(!out.contains("bigint: Failed to load bindings"));
+        assert!(out.contains("Invalid model format"));
+    }
+
+    #[test]
+    fn preserves_unrelated_lines() {
+        let input = "Some warning\nReal error message";
+        assert_eq!(strip_known_noise(input), input);
+    }
+
+    #[test]
+    fn handles_empty() {
+        assert_eq!(strip_known_noise(""), "");
+    }
+
+    #[test]
+    fn handles_only_noise() {
+        let input = "bigint: Failed to load bindings, pure JS will be used\n\
+                     bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)";
+        assert_eq!(strip_known_noise(input), "");
     }
 }
