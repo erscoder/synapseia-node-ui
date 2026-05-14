@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] chore(release): 0.8.35 lockstep bump for node hardware hang hotfix (e63c9a0)
+
+Version-only bump. node-ui has no functional change in this cycle.
+Bundles node 0.8.35 (Windows nvidia-smi hang fix) via the standard
+install-on-demand path; users who already have the desktop app see
+the new node CLI auto-installed the next time they start their node.
+
 ## [2026-05-14] feat(ui): NVIDIA NIM provider + free-tier registration hint (9230c6c)
 
 NVIDIA NIM joins the cloud-LLM provider dropdown. Picking it surfaces
