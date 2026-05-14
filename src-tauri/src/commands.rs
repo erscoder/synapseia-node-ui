@@ -72,6 +72,24 @@ fn timeout_for(command: &str) -> Duration {
 pub struct NodeProcess {
     child: Option<Child>,
     logs: Arc<Mutex<Vec<String>>>,
+    /// Cached on the original `start_node` call so the auto-respawn path after
+    /// a self-update can re-spawn the CLI without prompting the user for the
+    /// wallet password again. Cleared on `stop_node` so a manual stop always
+    /// re-requires the password on next start.
+    cached_password: Option<String>,
+    /// Latched true when the CLI emits `[SELF_UPDATE_RESTART]` on stdout
+    /// (see packages/node/src/utils/self-updater.ts). The stdout reader
+    /// flips it; the EOF handler checks it to decide between auto-respawn
+    /// and "user-visible crash". Cleared after the respawn is dispatched
+    /// (success or failure) so a subsequent genuine crash isn't mistaken
+    /// for a self-update.
+    pending_self_update_restart: bool,
+    /// Monotonically incremented every time we spawn a node child. The stdout
+    /// EOF watcher captures the generation it was spawned for and only
+    /// triggers the respawn path if state.generation still matches — protects
+    /// against a manual stop+restart race where the OLD EOF handler would
+    /// otherwise spawn a third child on top of the user's fresh start.
+    generation: u64,
 }
 
 impl NodeProcess {
@@ -79,11 +97,25 @@ impl NodeProcess {
         Self {
             child: None,
             logs: Arc::new(Mutex::new(Vec::new())),
+            cached_password: None,
+            pending_self_update_restart: false,
+            generation: 0,
         }
     }
 }
 
 pub type NodeProcessState = Arc<Mutex<NodeProcess>>;
+
+/// Detect the self-update relaunch cue emitted by the CLI just before exit
+/// (`console.log('[SELF_UPDATE_RESTART] ...')` in
+/// packages/node/src/utils/self-updater.ts). Extracted so it can be unit
+/// tested without spawning a real process.
+pub fn parse_self_update_cue(line: &str) -> bool {
+    // Match the marker anywhere in the line — the CLI prints it raw via
+    // console.log, but log forwarders / tee'd terminals may prepend
+    // timestamps. We don't anchor at start.
+    line.contains("[SELF_UPDATE_RESTART]")
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NodeStatus {
@@ -905,7 +937,8 @@ pub async fn start_node(
     app: AppHandle,
     state: State<'_, NodeProcessState>,
 ) -> Result<NodeStatus, String> {
-    let mut node = state.lock().await;
+    let node_state: NodeProcessState = (*state).clone();
+    let mut node = node_state.lock().await;
 
     if node.child.is_some() {
         return Err("Node is already running".to_string());
@@ -925,8 +958,46 @@ pub async fn start_node(
         ));
     }
 
-    let mut cmd = build_node_command(Some(&app), &["start"])?;
-    cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password)
+    let pid = spawn_node_into_state(&mut node, &app, &password, false)?;
+
+    // Cache the password for the auto-respawn path. We only do this on the
+    // operator-initiated start_node so a successful unlock here becomes the
+    // basis for self-update restarts; stop_node clears it.
+    node.cached_password = Some(password);
+
+    drop(node);
+
+    Ok(NodeStatus {
+        running: true,
+        peer_id: None,
+        tier: None,
+        wallet: None,
+        balance_sol: None,
+        balance_syn: None,
+        staked_syn: None,
+        pid,
+    })
+}
+
+/// Spawn the node CLI as a child of the UI process, plug stdout/stderr into
+/// the existing log forwarders, and install the EOF watcher that handles
+/// the `[SELF_UPDATE_RESTART]` auto-respawn flow.
+///
+/// Caller must hold the `NodeProcess` mutex guard. Returns the spawned PID
+/// (None on systems where `Child::id()` is unavailable, e.g. after
+/// `.wait()` — should not happen for a freshly spawned child).
+///
+/// `is_respawn` is purely informational for log output today; it lets the
+/// emitted `node-self-update-restarted` event be distinguishable from a
+/// fresh operator-initiated start.
+fn spawn_node_into_state(
+    node: &mut NodeProcess,
+    app: &AppHandle,
+    password: &str,
+    is_respawn: bool,
+) -> Result<Option<u32>, String> {
+    let mut cmd = build_node_command(Some(app), &["start"])?;
+    cmd.env("SYNAPSEIA_WALLET_PASSWORD", password)
         .env("SYNAPSEIA_LAUNCH_SOURCE", "ui")
         .env("NODE_ENV", "production")
         .stdout(Stdio::piped())
@@ -957,19 +1028,43 @@ pub async fn start_node(
     let child_stderr = child.stderr.take();
 
     node.child = Some(child);
+    node.pending_self_update_restart = false;
+    node.generation = node.generation.wrapping_add(1);
     let logs = node.logs.clone();
+    let generation = node.generation;
 
-    drop(node);
+    if is_respawn {
+        let _ = app.emit(
+            "node-self-update-restarted",
+            &serde_json::json!({ "pid": pid }),
+        );
+    }
 
     if let (Some(stdout), Some(stderr)) = (child_stdout, child_stderr) {
         let app_out = app.clone();
         let app_err = app.clone();
+        let app_for_respawn = app.clone();
         let logs_out = logs.clone();
         let logs_err = logs.clone();
+        let state_for_respawn: NodeProcessState =
+            app.state::<NodeProcessState>().inner().clone();
 
+        // stdout reader: forward log lines AND detect the [SELF_UPDATE_RESTART]
+        // marker. On EOF (child closed stdout = process exiting/exited), if the
+        // self-update flag is set we trigger the auto-respawn flow.
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(raw)) = reader.next_line().await {
+                if parse_self_update_cue(&raw) {
+                    let mut guard = state_for_respawn.lock().await;
+                    // Only latch if the cue belongs to THE child we were spawned
+                    // for. A delayed line from a previous generation must not
+                    // flag a freshly started node for respawn.
+                    if guard.generation == generation {
+                        guard.pending_self_update_restart = true;
+                    }
+                    drop(guard);
+                }
                 let (level_override, message) = sanitise_log_line(&raw, "stdout");
                 let log = LogLine {
                     timestamp: now_hhmmss(),
@@ -982,6 +1077,12 @@ pub async fn start_node(
                     .push(format!("[{}] {}", log.timestamp, log.message));
                 let _ = app_out.emit("node-log", &log);
             }
+            // EOF on stdout = the child process has closed its stdout, which
+            // for our Node.js CLI happens at exit. Decide whether to auto-
+            // respawn based on the flag latched above. We deliberately do
+            // NOT try to differentiate exit-codes here: any clean exit that
+            // emitted the cue is treated as a self-update relaunch request.
+            handle_node_eof(state_for_respawn, app_for_respawn, generation).await;
         });
 
         tokio::spawn(async move {
@@ -1002,21 +1103,98 @@ pub async fn start_node(
         });
     }
 
-    Ok(NodeStatus {
-        running: true,
-        peer_id: None,
-        tier: None,
-        wallet: None,
-        balance_sol: None,
-        balance_syn: None,
-        staked_syn: None,
-        pid,
-    })
+    Ok(pid)
+}
+
+/// Called from the stdout reader when EOF is hit (child exited). Drives the
+/// auto-respawn flow if the self-update cue was latched, otherwise leaves
+/// state alone (operator sees the crash via the absent `running` flag on
+/// the next status poll).
+async fn handle_node_eof(state: NodeProcessState, app: AppHandle, my_generation: u64) {
+    // Acquire the lock and decide what to do under it. Whatever we do must
+    // be cheap — we hold the lock long enough for the respawn dispatch.
+    let mut guard = state.lock().await;
+
+    // Stale handler: a newer generation has already taken over (operator
+    // clicked Start again after a manual stop, etc). Bail without touching
+    // anything — the newer streamers own the state now.
+    if guard.generation != my_generation {
+        return;
+    }
+
+    let pending = guard.pending_self_update_restart;
+    let pid = guard.child.as_ref().and_then(|c| c.id());
+
+    // The child closed stdout — for our purposes it's gone. Drop the
+    // handle so `node_status` reports running=false and any future
+    // `start_node` from the UI can proceed.
+    guard.child = None;
+    guard.pending_self_update_restart = false;
+
+    // Release any lockfile that still belongs to us. The CLI is supposed
+    // to clean up its own lock, but a self-update exits before the
+    // shutdown hooks run on some platforms, so this is the safety net.
+    cleanup_lock_if_ours(pid);
+
+    if !pending {
+        // Genuine exit (crash or user-invoked stop). Preserve existing
+        // behaviour: do nothing, the user sees the stopped state.
+        return;
+    }
+
+    // Self-update path. We need a cached password to respawn — if it's
+    // gone (operator locked the wallet between updates) surface an error
+    // event so the UI can prompt for re-unlock.
+    let Some(password) = guard.cached_password.clone() else {
+        eprintln!(
+            "[synapseia-node-ui] auto-respawn blocked: wallet locked, no cached password"
+        );
+        let _ = app.emit(
+            "node-self-update-restart-failed",
+            &serde_json::json!({
+                "reason": "wallet-locked",
+                "message": "Auto-restart blocked: wallet locked. Click Start to unlock and resume.",
+            }),
+        );
+        return;
+    };
+
+    // Respawn. We're already holding the mutex, so call the helper
+    // directly. Any failure surfaces as an event the UI can toast.
+    match spawn_node_into_state(&mut guard, &app, &password, true) {
+        Ok(new_pid) => {
+            eprintln!(
+                "[synapseia-node-ui] auto-respawned after self-update: pid={:?}",
+                new_pid
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[synapseia-node-ui] auto-respawn after self-update failed: {}",
+                e
+            );
+            let _ = app.emit(
+                "node-self-update-restart-failed",
+                &serde_json::json!({
+                    "reason": "spawn-failed",
+                    "message": e,
+                }),
+            );
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn stop_node(state: State<'_, NodeProcessState>) -> Result<bool, String> {
     let mut node = state.lock().await;
+    // A manual stop must NOT auto-respawn even if the CLI happened to be
+    // mid-self-update when the operator clicked Stop. Clear both the flag
+    // and the cached password — the next start will re-prompt.
+    node.pending_self_update_restart = false;
+    node.cached_password = None;
+    // Bump generation so any in-flight EOF watcher from this child can't
+    // mistake itself for the current owner of state when it wakes up.
+    node.generation = node.generation.wrapping_add(1);
     if let Some(mut child) = node.child.take() {
         child.kill().await.map_err(|e| e.to_string())?;
         cleanup_lock_if_ours(child.id());
@@ -1037,6 +1215,10 @@ pub fn reap_on_exit(state: &NodeProcessState) {
     // `try_lock` silently skipped the kill when any task happened to hold
     // the lock, leaving the node process alive after the window closed.
     let mut guard = state.blocking_lock();
+    // App is shutting down — no auto-respawn under any circumstances.
+    guard.pending_self_update_restart = false;
+    guard.cached_password = None;
+    guard.generation = guard.generation.wrapping_add(1);
     if let Some(mut child) = guard.child.take() {
         let pid = child.id();
 
@@ -2347,5 +2529,128 @@ mod strip_known_noise_tests {
         let input = "bigint: Failed to load bindings, pure JS will be used\n\
                      bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)";
         assert_eq!(strip_known_noise(input), "");
+    }
+}
+
+#[cfg(test)]
+mod self_update_tests {
+    //! Unit tests for the self-update relaunch detection. These tests are
+    //! intentionally pure: they only exercise `parse_self_update_cue` plus
+    //! the NodeProcess state transitions that the EOF handler would do on
+    //! a real exit. We do NOT spawn real child processes — `tokio::process`
+    //! is integration territory.
+
+    use super::*;
+
+    #[test]
+    fn detects_canonical_marker() {
+        assert!(parse_self_update_cue(
+            "[SELF_UPDATE_RESTART] Update applied, exiting for relaunch."
+        ));
+    }
+
+    #[test]
+    fn detects_marker_with_timestamp_prefix() {
+        // Log forwarders / tee'd terminals can prepend a timestamp before
+        // the marker line. The parser must still detect the cue.
+        assert!(parse_self_update_cue(
+            "2026-05-13T22:00:00.000Z [SELF_UPDATE_RESTART] Update applied"
+        ));
+    }
+
+    #[test]
+    fn ignores_unrelated_lines() {
+        assert!(!parse_self_update_cue("INFO node started"));
+        assert!(!parse_self_update_cue(""));
+        // Substring of the marker but missing the brackets should NOT match.
+        assert!(!parse_self_update_cue("SELF_UPDATE_RESTART (no brackets)"));
+        // Different bracketed marker must not false-positive.
+        assert!(!parse_self_update_cue("[SELF_UPDATE_DOWNLOAD] something"));
+    }
+
+    // We can't pull in `#[tokio::test]` without adding the `macros` /
+    // `rt-multi-thread` feature to tokio (forbidden by this sprint). Build
+    // a current-thread runtime by hand from the `rt` feature we already
+    // depend on and drive each scenario via `block_on`.
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    }
+
+    #[test]
+    fn pending_flag_gates_respawn_decision() {
+        // Models the contract used by handle_node_eof: the EOF watcher
+        // only triggers respawn when the flag was latched by the stdout
+        // reader. This test runs that decision purely on the state
+        // struct without touching the Tauri app handle.
+        rt().block_on(async {
+            let proc = Arc::new(Mutex::new(NodeProcess::new()));
+
+            {
+                let mut g = proc.lock().await;
+                assert!(!g.pending_self_update_restart);
+                g.pending_self_update_restart = parse_self_update_cue(
+                    "[SELF_UPDATE_RESTART] Update applied, exiting for relaunch.",
+                );
+            }
+
+            let g = proc.lock().await;
+            assert!(g.pending_self_update_restart);
+        });
+    }
+
+    #[test]
+    fn generation_bump_invalidates_stale_eof_handler() {
+        // stop_node bumps the generation before clearing state. A stale
+        // EOF watcher from the previously-running child must observe the
+        // mismatch and bail without touching state.
+        rt().block_on(async {
+            let proc = Arc::new(Mutex::new(NodeProcess::new()));
+            let captured_generation = {
+                let mut g = proc.lock().await;
+                g.generation = 5;
+                g.generation
+            };
+
+            // Simulate stop_node bumping the generation.
+            {
+                let mut g = proc.lock().await;
+                g.generation = g.generation.wrapping_add(1);
+            }
+
+            let g = proc.lock().await;
+            assert_ne!(
+                g.generation, captured_generation,
+                "generation must change so stale EOF handler bails out"
+            );
+        });
+    }
+
+    #[test]
+    fn stop_node_clears_cached_password_and_flag() {
+        // Manual stop must wipe both fields so a later restart re-prompts
+        // for the wallet password and never auto-respawns a stale process.
+        rt().block_on(async {
+            let proc = Arc::new(Mutex::new(NodeProcess::new()));
+            {
+                let mut g = proc.lock().await;
+                g.cached_password = Some("secret".into());
+                g.pending_self_update_restart = true;
+            }
+
+            // Mimic stop_node's bookkeeping (without killing a real child).
+            {
+                let mut g = proc.lock().await;
+                g.pending_self_update_restart = false;
+                g.cached_password = None;
+                g.generation = g.generation.wrapping_add(1);
+            }
+
+            let g = proc.lock().await;
+            assert!(g.cached_password.is_none());
+            assert!(!g.pending_self_update_restart);
+        });
     }
 }

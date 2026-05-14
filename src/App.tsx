@@ -458,7 +458,15 @@ function App() {
         )}
         {activePanel === "system" && <SystemPanel />}
         {activePanel === "settings" && <SettingsPanel password={password} />}
-        {activePanel === "logs" && <LogViewer logs={logs} />}
+        {activePanel === "logs" && (
+          <LogViewer
+            logs={logs}
+            status={nodeStatus}
+            password={password}
+            onStart={handleStartNode}
+            onStop={handleStopNode}
+          />
+        )}
       </main>
     </div>
   );

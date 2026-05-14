@@ -1,12 +1,19 @@
 import { useEffect, useRef } from "react";
-import { LogLine } from "../App";
-import { Download } from "lucide-react";
+import { LogLine, NodeStatus } from "../App";
+import { Download, Play, Square } from "lucide-react";
 
 interface Props {
   logs: LogLine[];
+  // Same shape MyNodePanel uses so we keep a single source-of-truth (the
+  // App-level NodeStatus + password + onStart/onStop handlers). Avoids
+  // duplicating local state here.
+  status: NodeStatus;
+  password: string | null;
+  onStart: () => void;
+  onStop: () => void;
 }
 
-export function LogViewer({ logs }: Props) {
+export function LogViewer({ logs, status, password, onStart, onStop }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -41,6 +48,26 @@ export function LogViewer({ logs }: Props) {
       <div className="flex items-center justify-between shrink-0">
         <h1 className="text-2xl font-bold text-slate-100">Logs</h1>
         <div className="flex gap-2">
+          {status.running ? (
+            <button
+              onClick={onStop}
+              aria-label="Stop node"
+              className="flex items-center gap-2 px-4 py-2 bg-[var(--accent-red)]/90 hover:bg-[var(--accent-red)] text-white rounded-lg text-sm font-medium transition-all shadow-lg shadow-red-500/20 border border-[var(--accent-red)]/40"
+            >
+              <Square className="w-4 h-4" />
+              Stop Node
+            </button>
+          ) : (
+            <button
+              onClick={onStart}
+              disabled={!password}
+              aria-label="Start node"
+              className="flex items-center gap-2 px-4 py-2 bg-[var(--accent-cyan)]/90 hover:bg-[var(--accent-cyan)] disabled:opacity-40 disabled:cursor-not-allowed text-[var(--bg-primary)] rounded-lg text-sm font-medium transition-all shadow-lg shadow-cyan-500/20 border border-[var(--accent-cyan)]/40"
+            >
+              <Play className="w-4 h-4" />
+              Start Node
+            </button>
+          )}
           <button
             onClick={handleExport}
             className="flex items-center gap-2 px-4 py-2 bg-[var(--bg-surface)] hover:opacity-90 text-slate-300 rounded-lg text-sm font-medium transition-all"
