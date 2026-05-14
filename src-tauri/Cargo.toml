@@ -1,6 +1,6 @@
 [package]
 name = "synapseia-node-ui"
-version = "0.8.34"
+version = "0.8.35"
 description = "Synapseia Node Desktop UI"
 authors = ["Synapseia"]
 edition = "2021"
