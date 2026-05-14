@@ -1,5 +1,25 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] fix(tauri): spawn dist/bootstrap.js to enable bigint warning filter (356cec8)
+
+Bug: the `bigint-buffer` console.warn / `process.stderr.write`
+filters installed by the node CLI's `bootstrap.ts` (0.8.38)
+were bypassed in every Tauri spawn because `build_node_command`
+pointed at `dist/index.js` directly. The `bootstrap.ts` entry
+point is what registers the filters BEFORE the heavy Solana dep
+graph starts loading, so spawning `index.js` skips the patches
+entirely and the warning still leaked into captured stderr on
+every platform up to 0.8.39.
+
+Fix: prefer `dist/bootstrap.js` when it exists, fall back to
+`dist/index.js` for legacy CLI tarballs (`< 0.8.0`) without the
+bootstrap layer. Same args, same exit-code semantics — commander
+in `index.js` consumes `process.argv.slice(2)` so `argv[1]` being
+`bootstrap.js` is transparent.
+
+Version: 0.8.39 -> 0.8.40 (lockstep with coord + node).
+
+
 ## [2026-05-14] fix(settings): ui-settings fallback for cloud LLM dots (06aade2)
 
 Bug: after saving a cloud LLM API key, navigating to another tab,
