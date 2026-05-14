@@ -1,5 +1,18 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] chore(release): 0.8.37 lockstep bump for node multi-slash slug fix (e8f6a8b)
+
+Version-only bump. Node-ui has no functional change in this cycle.
+Node 0.8.37 fixes the NVIDIA NIM persistence bug — CLI
+`--set-model` regex now accepts multi-slash modelIds like
+`nvidia/meta/llama-3.3-70b-instruct` and
+`nvidia/nvidia/nemotron-3-super-120b-a12b`. The Settings panel
+no longer surfaces "Failed to apply CLI config update --set-model"
+when the operator picks NVIDIA NIM tiers; provider/model/API key
+now persist correctly end-to-end. Lockstep keeps coord + node +
+node-ui versioned together.
+
+
 ## [2026-05-14] fix(settings): persist cloud LLM config end-to-end (83abca2)
 
 Production bug: Windows operators selecting NVIDIA NIM (or any cloud
