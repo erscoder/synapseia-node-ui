@@ -216,12 +216,29 @@ pub async fn wallet_exists() -> Result<WalletExists, String> {
 // and injects it as an env var whenever it spawns the CLI. Keeps the CLI
 // surface unchanged and avoids fighting the deprecated `--llm-url` flag.
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct UiSettings {
     /// Empty string means "use the built-in default
     /// (http://localhost:11434)" — never persisted as a literal fallback.
     #[serde(default, rename = "ollamaUrl")]
     pub ollama_url: String,
+    /// LLM provider id selected in the desktop UI. Empty string or
+    /// "ollama" (case-insensitive) means "use local Ollama". Any other
+    /// value (e.g. "nvidia", "openai") is treated as a cloud provider
+    /// and forwarded to the spawned CLI via LLM_CLOUD_PROVIDER + the
+    /// corresponding <PROVIDER>_API_KEY env var.
+    #[serde(default, rename = "llmProvider")]
+    pub llm_provider: String,
+    /// Cloud model slug (the part AFTER the provider/ prefix). Empty
+    /// string when the operator picked the Ollama provider, since the
+    /// model is part of the slug stored in the CLI config in that case.
+    #[serde(default, rename = "llmModelSlug")]
+    pub llm_model_slug: String,
+    /// Plaintext API key for the chosen cloud provider. Persisted in
+    /// ui-settings.json with 0o600 perms on Unix. Empty string means
+    /// "not configured" (operator can still set the env var externally).
+    #[serde(default, rename = "llmApiKey")]
+    pub llm_api_key: String,
 }
 
 fn ui_settings_path() -> PathBuf {
@@ -259,19 +276,72 @@ fn write_ui_settings_raw(settings: &UiSettings) -> Result<(), String> {
             path.to_string_lossy(),
             e
         )
-    })
+    })?;
+    // The file holds a plaintext cloud LLM API key. On Unix, pin it to
+    // 0o600 (owner read/write only) so a multi-user box doesn't expose
+    // the credential to other accounts. Windows inherits the
+    // %USERPROFILE% ACL which is already user-restricted by default;
+    // pinning ACLs here would require an extra crate and is out of
+    // scope for this slice.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        // Best-effort: a perm-set failure should not abort the write
+        // (the file is already on disk with default perms; logging
+        // surfaces the problem without breaking the user flow).
+        if let Err(e) = std::fs::set_permissions(&path, perms) {
+            log::warn!(
+                "failed to chmod 600 on {}: {}",
+                path.to_string_lossy(),
+                e
+            );
+        }
+    }
+    Ok(())
 }
 
-/// Trim + reject empty strings so callers never push a whitespace-only env var
-/// into the spawned CLI.
-fn normalized_ollama_url() -> Option<String> {
-    let raw = read_ui_settings_raw().ollama_url;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+/// Map a provider id (as stored in ui-settings.json) to the env var the
+/// node CLI reads to authenticate against that provider. Mirrors the
+/// `apiKeyEnvVar` table in `packages/node-ui/src/lib/providers.ts` and
+/// `packages/node/src/modules/llm/providers.ts`. Returns None for
+/// unknown ids (caller skips API-key injection in that case).
+pub(crate) fn api_key_env_for_provider(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
+        "moonshot" => Some("MOONSHOT_API_KEY"),
+        "minimax" => Some("MINIMAX_API_KEY"),
+        "zhipu" => Some("ZHIPU_API_KEY"),
+        "nvidia" => Some("NVIDIA_API_KEY"),
+        _ => None,
     }
+}
+
+/// Resolve the cloud LLM env vars to inject when spawning the node CLI.
+/// Returns None when the operator picked Ollama (the local path), or
+/// when the persisted selection is incomplete (no provider, or no model
+/// slug). Each tuple element is (env_name, env_value). Empty API keys
+/// are still emitted so the CLI surfaces a clear "missing key" error
+/// instead of silently falling back to a different provider.
+pub(crate) fn cloud_llm_env_for(settings: &UiSettings) -> Option<Vec<(String, String)>> {
+    let provider = settings.llm_provider.trim();
+    let slug = settings.llm_model_slug.trim();
+    if provider.is_empty() || slug.is_empty() {
+        return None;
+    }
+    if provider.eq_ignore_ascii_case("ollama") {
+        return None;
+    }
+    let mut env: Vec<(String, String)> = Vec::with_capacity(4);
+    env.push(("LLM_PROVIDER".to_string(), "cloud".to_string()));
+    env.push(("LLM_CLOUD_PROVIDER".to_string(), provider.to_string()));
+    env.push(("LLM_CLOUD_MODEL".to_string(), slug.to_string()));
+    if let Some(key_env) = api_key_env_for_provider(provider) {
+        env.push((key_env.to_string(), settings.llm_api_key.clone()));
+    }
+    Some(env)
 }
 
 #[tauri::command]
@@ -280,7 +350,12 @@ pub async fn get_ui_settings() -> Result<UiSettings, String> {
 }
 
 #[tauri::command]
-pub async fn set_ui_settings(ollama_url: String) -> Result<UiSettings, String> {
+pub async fn set_ui_settings(
+    ollama_url: String,
+    llm_provider: Option<String>,
+    llm_model_slug: Option<String>,
+    llm_api_key: Option<String>,
+) -> Result<UiSettings, String> {
     let trimmed = ollama_url.trim();
     // Soft URL shape validation here mirrors the JS-side check so a malformed
     // value can't sneak in via a direct invoke() call from devtools.
@@ -292,8 +367,17 @@ pub async fn set_ui_settings(ollama_url: String) -> Result<UiSettings, String> {
             return Err("Ollama URL must not end with a trailing slash".to_string());
         }
     }
+    // Merge: each None field leaves the previously-persisted value
+    // untouched so the frontend can update partial subsets (e.g. only
+    // the API key) without round-tripping the rest. Some("") explicitly
+    // clears a field — that is the path the UI takes when the operator
+    // switches back from a cloud provider to Ollama.
+    let current = read_ui_settings_raw();
     let next = UiSettings {
         ollama_url: trimmed.to_string(),
+        llm_provider: llm_provider.unwrap_or(current.llm_provider),
+        llm_model_slug: llm_model_slug.unwrap_or(current.llm_model_slug),
+        llm_api_key: llm_api_key.unwrap_or(current.llm_api_key),
     };
     write_ui_settings_raw(&next)?;
     Ok(next)
@@ -1129,8 +1213,23 @@ fn build_node_command(app: Option<&AppHandle>, args: &[&str]) -> Result<Command,
     // CLI falls through to its hardcoded default (http://localhost:11434).
     // The CLI reads `OLLAMA_URL` across embeddings, hardware probe, ollama
     // chat, and training-llm.
-    if let Some(url) = normalized_ollama_url() {
-        cmd.env("OLLAMA_URL", url);
+    let settings = read_ui_settings_raw();
+    let ollama_url = settings.ollama_url.trim();
+    if !ollama_url.is_empty() {
+        cmd.env("OLLAMA_URL", ollama_url);
+    }
+    // Cloud LLM env vars. The node CLI reads LLM_PROVIDER=cloud +
+    // LLM_CLOUD_PROVIDER + LLM_CLOUD_MODEL + <PROVIDER>_API_KEY to wire
+    // the selected provider into its inference adapters. If the operator
+    // picked Ollama (or never picked a provider), we skip these and the
+    // CLI falls back to local inference. This is the fix for the Windows
+    // "settings revert to Ollama" bug: previously the Tauri shell never
+    // forwarded the provider/key, so every spawn looked like a local-only
+    // run regardless of what the UI had saved.
+    if let Some(env_pairs) = cloud_llm_env_for(&settings) {
+        for (k, v) in env_pairs {
+            cmd.env(k, v);
+        }
     }
     Ok(cmd)
 }
@@ -2028,4 +2127,165 @@ pub async fn docking_capabilities() -> Result<DockingCapabilities, String> {
         obabel_path: obabel_path.as_ref().map(|p| p.display().to_string()),
         obabel_version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_settings_roundtrip_full() {
+        // Full-shape roundtrip: every field present, JSON keys are camelCase
+        // (matching the wire format used by invoke() from the React side).
+        let original = UiSettings {
+            ollama_url: "http://localhost:11435".to_string(),
+            llm_provider: "nvidia".to_string(),
+            llm_model_slug: "meta/llama-3.3-70b-instruct".to_string(),
+            llm_api_key: "nvapi-test-key".to_string(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(json.contains("\"ollamaUrl\""));
+        assert!(json.contains("\"llmProvider\""));
+        assert!(json.contains("\"llmModelSlug\""));
+        assert!(json.contains("\"llmApiKey\""));
+        let decoded: UiSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn ui_settings_backward_compat_only_ollama_url() {
+        // Legacy ui-settings.json files written by 0.8.35 and earlier only
+        // contain the ollamaUrl field. The new fields must default to "" so
+        // existing users do not see a deserialize crash on first launch
+        // after the upgrade.
+        let legacy_json = r#"{ "ollamaUrl": "http://10.0.0.5:11434" }"#;
+        let decoded: UiSettings =
+            serde_json::from_str(legacy_json).expect("legacy json must deserialize");
+        assert_eq!(decoded.ollama_url, "http://10.0.0.5:11434");
+        assert_eq!(decoded.llm_provider, "");
+        assert_eq!(decoded.llm_model_slug, "");
+        assert_eq!(decoded.llm_api_key, "");
+    }
+
+    #[test]
+    fn ui_settings_backward_compat_empty_object() {
+        // The absolute floor: a brand-new install with no fields at all.
+        let decoded: UiSettings = serde_json::from_str("{}").expect("empty object");
+        assert_eq!(decoded, UiSettings::default());
+    }
+
+    #[test]
+    fn api_key_env_for_provider_known_providers() {
+        // Every entry here must match the CLOUD_PROVIDERS_UI table in
+        // packages/node-ui/src/lib/providers.ts. If the two drift, the
+        // spawned CLI will be authenticated against the wrong env var.
+        assert_eq!(api_key_env_for_provider("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(
+            api_key_env_for_provider("anthropic"),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(api_key_env_for_provider("google"), Some("GEMINI_API_KEY"));
+        assert_eq!(
+            api_key_env_for_provider("moonshot"),
+            Some("MOONSHOT_API_KEY")
+        );
+        assert_eq!(
+            api_key_env_for_provider("minimax"),
+            Some("MINIMAX_API_KEY")
+        );
+        assert_eq!(api_key_env_for_provider("zhipu"), Some("ZHIPU_API_KEY"));
+        assert_eq!(api_key_env_for_provider("nvidia"), Some("NVIDIA_API_KEY"));
+    }
+
+    #[test]
+    fn api_key_env_for_provider_case_insensitive_and_trim() {
+        // Operators may end up with mixed-case provider ids if a future
+        // migration touches the field. Lowercasing here is defensive.
+        assert_eq!(api_key_env_for_provider("NVIDIA"), Some("NVIDIA_API_KEY"));
+        assert_eq!(api_key_env_for_provider(" openai "), Some("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn api_key_env_for_provider_unknown() {
+        assert_eq!(api_key_env_for_provider("ollama"), None);
+        assert_eq!(api_key_env_for_provider(""), None);
+        assert_eq!(api_key_env_for_provider("custom"), None);
+        assert_eq!(api_key_env_for_provider("openrouter"), None);
+    }
+
+    #[test]
+    fn cloud_llm_env_skips_ollama_and_empty() {
+        // Ollama selection: caller should NOT inject any cloud env vars.
+        let ollama = UiSettings {
+            ollama_url: "http://localhost:11434".to_string(),
+            llm_provider: "ollama".to_string(),
+            llm_model_slug: "qwen2.5:0.5b".to_string(),
+            llm_api_key: "".to_string(),
+        };
+        assert!(cloud_llm_env_for(&ollama).is_none());
+
+        // Empty provider: equivalent to "operator never picked anything".
+        let empty_provider = UiSettings {
+            llm_provider: "".to_string(),
+            llm_model_slug: "nvidia/foo".to_string(),
+            ..UiSettings::default()
+        };
+        assert!(cloud_llm_env_for(&empty_provider).is_none());
+
+        // Empty model slug: incomplete selection, treat as not configured.
+        let empty_slug = UiSettings {
+            llm_provider: "nvidia".to_string(),
+            llm_model_slug: "".to_string(),
+            ..UiSettings::default()
+        };
+        assert!(cloud_llm_env_for(&empty_slug).is_none());
+    }
+
+    #[test]
+    fn cloud_llm_env_for_nvidia_emits_expected_pairs() {
+        let nvidia = UiSettings {
+            ollama_url: "".to_string(),
+            llm_provider: "nvidia".to_string(),
+            llm_model_slug: "meta/llama-3.3-70b-instruct".to_string(),
+            llm_api_key: "nvapi-abc".to_string(),
+        };
+        let env = cloud_llm_env_for(&nvidia).expect("nvidia selection must inject env");
+        let map: std::collections::HashMap<String, String> = env.into_iter().collect();
+        assert_eq!(map.get("LLM_PROVIDER").map(|s| s.as_str()), Some("cloud"));
+        assert_eq!(
+            map.get("LLM_CLOUD_PROVIDER").map(|s| s.as_str()),
+            Some("nvidia")
+        );
+        assert_eq!(
+            map.get("LLM_CLOUD_MODEL").map(|s| s.as_str()),
+            Some("meta/llama-3.3-70b-instruct")
+        );
+        assert_eq!(
+            map.get("NVIDIA_API_KEY").map(|s| s.as_str()),
+            Some("nvapi-abc")
+        );
+    }
+
+    #[test]
+    fn cloud_llm_env_for_unknown_provider_skips_key_env() {
+        // A future / unknown provider id still produces LLM_PROVIDER + the
+        // cloud target so the CLI surfaces a clear "unknown provider"
+        // error rather than silently dropping the selection. The API key
+        // env is omitted because we have no name to bind it to.
+        let unknown = UiSettings {
+            ollama_url: "".to_string(),
+            llm_provider: "future-provider".to_string(),
+            llm_model_slug: "future-provider/some-model".to_string(),
+            llm_api_key: "x".to_string(),
+        };
+        let env = cloud_llm_env_for(&unknown).expect("unknown provider still emits cloud env");
+        let map: std::collections::HashMap<String, String> = env.into_iter().collect();
+        assert_eq!(map.get("LLM_PROVIDER").map(|s| s.as_str()), Some("cloud"));
+        assert_eq!(
+            map.get("LLM_CLOUD_PROVIDER").map(|s| s.as_str()),
+            Some("future-provider")
+        );
+        // No <PROVIDER>_API_KEY entry should be emitted.
+        assert!(map.keys().all(|k| !k.ends_with("_API_KEY")));
+    }
 }

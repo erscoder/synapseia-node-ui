@@ -81,10 +81,18 @@ export function CreateNodeScreen({ onCreated }: Props) {
     try {
       // Persist the Ollama endpoint override BEFORE spawning the CLI so
       // `build_node_command` injects `OLLAMA_URL` into the wallet-create
-      // process. Empty string is preserved as "use default".
+      // process. Empty string is preserved as "use default". We only
+      // forward the Ollama URL at this point; the cloud provider +
+      // model + API key are persisted AFTER create_wallet succeeds so a
+      // failed wallet creation does not leave half-written settings.
       if (isLocalModel) {
         try {
-          await invoke("set_ui_settings", { ollamaUrl: ollamaUrl.trim() });
+          await invoke("set_ui_settings", {
+            ollamaUrl: ollamaUrl.trim(),
+            llmProvider: "ollama",
+            llmModelSlug: "",
+            llmApiKey: null,
+          });
         } catch {
           // Non-fatal: an older Tauri shell without the command should not
           // block wallet creation. The CLI will just fall back to the
@@ -107,6 +115,24 @@ export function CreateNodeScreen({ onCreated }: Props) {
         setError(result.error_message ?? "Wallet creation failed.");
         setLoading(false);
         return;
+      }
+
+      // Mirror the operator's initial LLM selection into the Tauri-side
+      // ui-settings store so the FIRST `synapseia start` already sees the
+      // cloud LLM env vars. Previously this was only written on a later
+      // Settings save, which meant the very first node start crashed on
+      // Windows when no local Ollama was present. Best-effort: a Tauri
+      // shell that predates these fields just rejects the call and we
+      // continue (the Settings panel will rewrite it next save).
+      try {
+        await invoke("set_ui_settings", {
+          ollamaUrl: isLocalModel ? ollamaUrl.trim() : "",
+          llmProvider: isLocalModel ? "ollama" : selection.provider,
+          llmModelSlug: isLocalModel ? "" : modelToSave,
+          llmApiKey: needsCredentials ? llmKey.trim() : null,
+        });
+      } catch {
+        // Non-fatal: see comment above.
       }
 
       onCreated(password, result.wallet_address);

@@ -192,6 +192,10 @@ export function SettingsPanel({ password }: Props) {
     setSuccess(null);
     try {
       const modelToSave = slugFromSelection(selection);
+      const parsedSelection = selection;
+      const isCloud = parsedSelection.kind === "cloud";
+      const providerId = isCloud ? parsedSelection.provider : "ollama";
+
       const updates: { flag: string; value: string }[] = [];
       if (config.name) updates.push({ flag: "--set-name", value: config.name });
       if (modelToSave) updates.push({ flag: "--set-model", value: modelToSave });
@@ -201,19 +205,46 @@ export function SettingsPanel({ password }: Props) {
         updates.push({ flag: "--set-llm-key", value: config.llmKey });
       }
 
+      // Run each CLI update and check the result explicitly. On Windows
+      // the wallet-password subprocess interaction can fail silently;
+      // previously we ignored the result and called loadConfig() which
+      // re-read the unchanged CLI config and made the UI appear to
+      // revert to the default Ollama selection. Treat any non-success
+      // as a hard error so the operator actually sees what went wrong.
       for (const u of updates) {
-        await invoke<CommandResult>("run_command", {
+        const result = await invoke<CommandResult>("run_command", {
           command: "config",
           args: [u.flag, u.value],
           password,
         });
+        if (!result.success) {
+          const detail = result.error || result.output || "(no output)";
+          throw new Error(
+            `Failed to apply CLI config update ${u.flag}: ${detail.slice(0, 400)}`,
+          );
+        }
       }
 
-      // Persist the Ollama endpoint override via the Tauri-side store. Empty
-      // string is intentionally preserved as "use default" — Rust trims and
-      // skips the env var when blank. We always send the call so that
-      // clearing the field overwrites a previously saved value.
-      await invoke("set_ui_settings", { ollamaUrl: config.ollamaUrl.trim() });
+      // Persist the full LLM selection (provider + model + key) via the
+      // Tauri-side store. This is the source of truth for env vars
+      // injected into every spawned CLI; the CLI config file is kept
+      // in sync via the --set-* calls above as a secondary path.
+      // - ollamaUrl: always sent so clearing the field overwrites a
+      //   previously saved value.
+      // - llmApiKey: only forwarded when the operator typed a new key
+      //   (null preserves the previously persisted plaintext on the
+      //   Rust side so reading the "__STORED__" sentinel never wipes a
+      //   working credential).
+      const newApiKey =
+        config.llmKey && config.llmKey !== "__STORED__"
+          ? config.llmKey
+          : null;
+      await invoke("set_ui_settings", {
+        ollamaUrl: config.ollamaUrl.trim(),
+        llmProvider: providerId,
+        llmModelSlug: isCloud ? modelToSave : "",
+        llmApiKey: newApiKey,
+      });
 
       setSuccess("Config saved successfully");
       await loadConfig();

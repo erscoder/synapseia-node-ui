@@ -1,7 +1,7 @@
 {
   "name": "@synapseia/node-ui",
   "private": true,
-  "version": "0.8.35",
+  "version": "0.8.36",
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "scripts": {
@@ -9,6 +9,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "clean": "rm -rf dist src-tauri/target/release/bundle && cd src-tauri && cargo clean --release",
     "build:dmg": "npm run clean && cd ../node && npm run build && cd ../node-ui && npm run build && npm run tauri -- build"
   },
@@ -27,13 +29,18 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.4",
     "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "@vitest/coverage-v8": "3.2.4",
     "autoprefixer": "^10.5.0",
+    "jsdom": "28.1.0",
     "postcss": "^8.5.10",
     "tailwindcss": "^4.2.1",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "3.2.4"
   }
 }
