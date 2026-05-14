@@ -1176,16 +1176,30 @@ pub async fn run_command(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Build a tokio Command that invokes `node <dist/index.js> <args...>` with:
+/// Build a tokio Command that invokes `node <dist/bootstrap.js> <args...>`
+/// (or `dist/index.js` as a fallback for pre-bootstrap CLI installs) with:
 ///   - an augmented PATH (GUI apps on macOS don't inherit shell PATH)
 ///   - the located @synapseia-network/node script
 ///
 /// `app` is optional so commands without an AppHandle in scope (chain-info,
 /// wallet-verify, run_command) still work — but when provided, the bundled-
 /// inside-resources CLI becomes available as the final safety-net fallback.
+///
+/// `dist/bootstrap.js` is preferred because it installs the
+/// `bigint-buffer` console.warn / stderr filter BEFORE the heavy CLI bundle
+/// (`dist/index.js`) starts loading transitive Solana deps. Spawning
+/// `dist/index.js` directly bypasses the filter, which is what leaked the
+/// "bigint: Failed to load bindings" warning into captured stderr on every
+/// platform up to 0.8.39. Pre-bootstrap CLI tarballs (< 0.8.0) fall back to
+/// `dist/index.js` so legacy installs keep working.
 fn build_node_command(app: Option<&AppHandle>, args: &[&str]) -> Result<Command, String> {
     let node_path = find_synapseia_node(app)?;
-    let script_path = format!("{}/dist/index.js", node_path);
+    let bootstrap_path = format!("{}/dist/bootstrap.js", node_path);
+    let script_path = if std::path::Path::new(&bootstrap_path).exists() {
+        bootstrap_path
+    } else {
+        format!("{}/dist/index.js", node_path)
+    };
 
     // Prefer system node, fall back to the bundled runtime under
     // ~/.synapseia/node/. install_synapseia_node downloads the latter when
