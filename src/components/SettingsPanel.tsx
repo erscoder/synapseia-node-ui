@@ -417,6 +417,20 @@ export function SettingsPanel({ password }: Props) {
                   : `API key for ${CLOUD_PROVIDERS_UI.find(p => p.id === selection.provider)?.label ?? "selected provider"}. ` +
                     `Env var: ${CLOUD_PROVIDERS_UI.find(p => p.id === selection.provider)?.apiKeyEnvVar ?? ""}.`}
               </p>
+              {selection.provider === "nvidia" && !hasStoredKey && (
+                <p className="text-xs text-emerald-300">
+                  Register free at{" "}
+                  <a
+                    href="https://build.nvidia.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline hover:text-emerald-200"
+                  >
+                    build.nvidia.com
+                  </a>{" "}
+                  to get your API key (~5,000 free credits/month).
+                </p>
+              )}
             </div>
           )}
         </div>

@@ -14,7 +14,8 @@ export type CloudProviderId =
   | "google"
   | "moonshot"
   | "minimax"
-  | "zhipu";
+  | "zhipu"
+  | "nvidia";
 
 export type ModelTier = "top" | "mid" | "budget";
 
@@ -91,6 +92,16 @@ export const CLOUD_PROVIDERS_UI: readonly UiCloudProvider[] = [
       top: { modelId: "glm-4.6", hint: "flagship" },
       mid: { modelId: "glm-4-plus", hint: "balanced" },
       budget: { modelId: "glm-4-flash", hint: "fast & cheap" },
+    },
+  },
+  {
+    id: "nvidia",
+    label: "NVIDIA NIM (free)",
+    apiKeyEnvVar: "NVIDIA_API_KEY",
+    models: {
+      top:    { modelId: "nvidia/nemotron-3-super-120b-a12b", hint: "120B MoE — NVIDIA flagship" },
+      mid:    { modelId: "meta/llama-3.3-70b-instruct",       hint: "70B — production stable" },
+      budget: { modelId: "meta/llama-3.2-3b-instruct",        hint: "3B — fast & light" },
     },
   },
 ];

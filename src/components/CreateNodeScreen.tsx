@@ -254,15 +254,31 @@ export function CreateNodeScreen({ onCreated }: Props) {
           )}
 
           {needsCredentials && (
-            <Input
-              label="LLM API Key"
-              type="password"
-              value={llmKey}
-              onChange={(e) => setLlmKey(e.target.value)}
-              placeholder="sk-..."
-              disabled={loading}
-              hint={`Or set env var ${CLOUD_PROVIDERS_UI.find(p => selection.kind === "cloud" && p.id === selection.provider)?.apiKeyEnvVar ?? ""}`}
-            />
+            <div className="space-y-1.5">
+              <Input
+                label="LLM API Key"
+                type="password"
+                value={llmKey}
+                onChange={(e) => setLlmKey(e.target.value)}
+                placeholder={selection.kind === "cloud" && selection.provider === "nvidia" ? "nvapi-..." : "sk-..."}
+                disabled={loading}
+                hint={`Or set env var ${CLOUD_PROVIDERS_UI.find(p => selection.kind === "cloud" && p.id === selection.provider)?.apiKeyEnvVar ?? ""}`}
+              />
+              {selection.kind === "cloud" && selection.provider === "nvidia" && (
+                <p className="text-xs text-emerald-300">
+                  Register free at{" "}
+                  <a
+                    href="https://build.nvidia.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline hover:text-emerald-200"
+                  >
+                    build.nvidia.com
+                  </a>{" "}
+                  to get your API key (~5,000 free credits/month).
+                </p>
+              )}
+            </div>
           )}
 
           {error && (
