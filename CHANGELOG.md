@@ -1,5 +1,27 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] fix(settings): ui-settings fallback for cloud LLM dots (06aade2)
+
+Bug: after saving a cloud LLM API key, navigating to another tab,
+then returning to Settings, the API key field rendered empty (no
+dots) even though `ui-settings.json` still had the key persisted.
+Root cause: `loadConfig` only read `parsed.llmKey` from the CLI's
+`config --show` output, so any CLI-side regression (silent
+`--set-llm-key` failure, stale CLI binary, etc.) made the panel
+look like it had lost the operator's selection.
+
+Fix: `loadConfig` now also pulls `llmApiKey` and `llmModelSlug`
+from `get_ui_settings`. When the CLI side has the real key, keep
+using it so the eye toggle can reveal the value. When only the
+Tauri side has it, use the existing `__STORED__` sentinel for
+`config.llmKey` so dots still render and the save path correctly
+skips re-sending the placeholder. Same fallback shape applied to
+the model slug so the dropdowns reflect the operator's last
+selection.
+
+Version: 0.8.38 -> 0.8.39 (lockstep with coord + node CLI fix).
+
+
 ## [2026-05-14] fix(tauri): strip bigint-buffer warning from captured CLI stderr (6c55563)
 
 Defense-in-depth complement to the node CLI fix shipped in node
