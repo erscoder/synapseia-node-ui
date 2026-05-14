@@ -1,5 +1,40 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] fix(settings): persist cloud LLM config end-to-end (83abca2)
+
+Production bug: Windows operators selecting NVIDIA NIM (or any cloud
+provider) + model + API key in Settings would silently revert to
+default Ollama after ~3 seconds, then the node would crash on next
+start with hasCloudLlm=false because no LLM_CLOUD_* env vars reached
+the CLI subprocess.
+
+Root cause: UiSettings struct only persisted ollama_url; the CLI
+spawn only forwarded OLLAMA_URL; SettingsPanel did not check
+run_command.success so a Windows-side CLI failure passed silently
+and loadConfig() then reverted the UI from the unchanged CLI
+config file.
+
+Fix wires the Tauri-side ui-settings.json as source of truth and
+threads cloud env vars into every CLI spawn:
+
+- UiSettings struct gains llm_provider, llm_model_slug, llm_api_key
+  with serde defaults so legacy ui-settings.json files still load.
+- set_ui_settings accepts 4 args (Option<String> merge semantics).
+- File perms 0o600 on Unix; Windows inherits %USERPROFILE% ACL.
+- build_node_command injects LLM_PROVIDER=cloud + LLM_CLOUD_PROVIDER
+  + LLM_CLOUD_MODEL + <PROVIDER>_API_KEY for the 7 cloud providers
+  on every CLI spawn when a non-ollama provider is selected.
+- SettingsPanel surfaces run_command failure as a real error and
+  skips loadConfig() so a failed save no longer silently reverts.
+- CreateNodeScreen mirrors the initial cloud selection to
+  ui-settings AFTER create_wallet succeeds so the first
+  synapseia start already has the env vars.
+
+9 Rust tests + 2 vitest tests covering serde compat, env injection,
+failure-surface flow, and the full 4-arg invoke shape.
+
+Version bump 0.8.35 -> 0.8.36 lockstep.
+
 ## [2026-05-14] chore(release): 0.8.35 lockstep bump for node hardware hang hotfix (e63c9a0)
 
 Version-only bump. node-ui has no functional change in this cycle.
