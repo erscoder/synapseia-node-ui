@@ -1,5 +1,24 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-14] feat(ui): NVIDIA NIM provider + free-tier registration hint (9230c6c)
+
+NVIDIA NIM joins the cloud-LLM provider dropdown. Picking it surfaces
+an emerald hint with a direct link to build.nvidia.com so operators
+without a paid LLM subscription or local GPU can run a node at zero
+cost using their personal NGC free-tier key (~5,000 credits/month).
+
+- `providers.ts` UI mirror gains the NVIDIA entry. Tiers match the
+  authoritative table in `@synapseia-network/node`:
+    top:    nvidia/nemotron-3-super-120b-a12b (120B MoE flagship).
+    mid:    meta/llama-3.3-70b-instruct (production stable).
+    budget: meta/llama-3.2-3b-instruct (fast & light).
+- `CreateNodeScreen.tsx`: conditional emerald hint rendered below the
+  API-key field whenever NVIDIA is selected. Links to build.nvidia.com.
+- `SettingsPanel.tsx`: same hint, rendered when NVIDIA is the active
+  provider and no key is currently stored.
+
+Version bump 0.8.33 -> 0.8.34 lockstep with coord + node + landing.
+
 ## [2026-05-12] ui(my-node-panel): mirror dashboard Rewards card refactor (5141c77)
 
 Brings the desktop app's `MyNodePanel` Rewards breakdown to behavior
