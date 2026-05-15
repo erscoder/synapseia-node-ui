@@ -1,5 +1,17 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.45 lockstep — Ollama-pick wizard regression hotfix (dc4426f)
+
+Version-only bump. Functional change lives in the node sub-repo
+(`a0bb328d` — three-layer fix: wizard emits `ollama/<tag>`,
+migration auto-prefixes unprefixed slugs, catalog adds
+`ollamaTag` field). Lockstep keeps coord + node + node-ui
+versioned together.
+
+Operators upgrading 0.8.44 → 0.8.45 on macOS / Windows see no
+behavioral change in the desktop UI; the auto-upgrade-at-boot
+flow added in 0.8.43 will pick up the new CLI on the next start.
+
 ## [2026-05-15] chore(release): 0.8.44 lockstep — Linux GPU pod hardware-detect hotfix (a04fffc)
 
 Version-only bump. Functional change lives in the node sub-repo
