@@ -1,5 +1,16 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.49 lockstep — staking-cli keystore + self-updater prefix (066b386)
+
+Version-only bump. Functional changes live in the node sub-repo
+(`79a45084` staking-cli → keystore + `85d71759` self-updater
+targets running install prefix). Lockstep keeps coord + node +
+node-ui versioned together.
+
+Operators upgrading 0.8.48 → 0.8.49 on macOS / Windows see no
+behavioral change in the desktop UI; the auto-upgrade-at-boot
+flow added in 0.8.43 picks up the new CLI on the next start.
+
 ## [2026-05-15] chore(release): 0.8.48 lockstep — persistent rpcUrl config + devnet default (4e4208a)
 
 Version-only bump. Functional change lives in the node sub-repo
