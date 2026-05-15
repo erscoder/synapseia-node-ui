@@ -1,5 +1,16 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.47 lockstep — staking-cli RPC default + fresh-install single passphrase (0778895)
+
+Version-only bump. Functional changes live in the node sub-repo
+(staking-cli `SOLANA_RPC_URL` mainnet fallback + fresh-install
+keystore-only path with one passphrase prompt). Lockstep keeps
+coord + node + node-ui versioned together.
+
+Operators upgrading 0.8.46 → 0.8.47 on macOS / Windows see no
+behavioral change in the desktop UI; the auto-upgrade-at-boot
+flow added in 0.8.43 picks up the new CLI on the next start.
+
 ## [2026-05-15] chore(release): 0.8.46 lockstep — Ollama tag canonicalisation + auto-pull + coord rotation revisitable (e7d4a21)
 
 Version-only bump. Functional changes live in node + coord
