@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "synapseia-node-ui"
-version = "0.8.44"
+version = "0.8.45"
 dependencies = [
  "dirs 5.0.1",
  "log",
