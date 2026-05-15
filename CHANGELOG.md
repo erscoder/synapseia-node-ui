@@ -1,5 +1,17 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.46 lockstep — Ollama tag canonicalisation + auto-pull + coord rotation revisitable (e7d4a21)
+
+Version-only bump. Functional changes live in node + coord
+sub-repos (node `cf0577b5` canonical Ollama tag migration +
+auto-pull retry; coord `726c6a07` `REVISITABLE_TYPES` for the
+peer-submission filter). Lockstep keeps coord + node + node-ui
+versioned together.
+
+Operators upgrading 0.8.45 → 0.8.46 on macOS / Windows see no
+behavioral change in the desktop UI; the auto-upgrade-at-boot
+flow added in 0.8.43 picks up the new CLI on the next start.
+
 ## [2026-05-15] chore(release): 0.8.45 lockstep — Ollama-pick wizard regression hotfix (dc4426f)
 
 Version-only bump. Functional change lives in the node sub-repo
