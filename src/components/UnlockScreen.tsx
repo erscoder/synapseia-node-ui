@@ -66,11 +66,11 @@ export function UnlockScreen({ onUnlock }: Props) {
         <Card padding="md" className="space-y-4">
           <Input
             type="password"
-            label="Wallet Password"
+            label="Vault passphrase"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && !loading && handleUnlock()}
-            placeholder="Enter your wallet password"
+            placeholder="Enter the 12+ character vault passphrase"
             disabled={loading}
             autoFocus
           />
@@ -93,7 +93,7 @@ export function UnlockScreen({ onUnlock }: Props) {
         </Card>
 
         <p className="text-xs text-slate-500 text-center">
-          Your password never leaves this machine. It only decrypts your local wallet.
+          The vault passphrase is the 12+ character one you set the first time you ran the node. It never leaves this machine — it decrypts the local wallet keystore.
         </p>
       </div>
     </div>
