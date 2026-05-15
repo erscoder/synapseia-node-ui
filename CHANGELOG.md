@@ -1,5 +1,16 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.48 lockstep — persistent rpcUrl config + devnet default (4e4208a)
+
+Version-only bump. Functional change lives in the node sub-repo
+(`782ee914` — persistent `rpcUrl` field in config, `syn config`
+wizard step, `--set-rpc-url` flag, resolver env > config > devnet).
+Lockstep keeps coord + node + node-ui versioned together.
+
+Operators upgrading 0.8.47 → 0.8.48 on macOS / Windows see no
+behavioral change in the desktop UI; the auto-upgrade-at-boot
+flow added in 0.8.43 picks up the new CLI on the next start.
+
 ## [2026-05-15] chore(release): 0.8.47 lockstep — staking-cli RPC default + fresh-install single passphrase (0778895)
 
 Version-only bump. Functional changes live in the node sub-repo
