@@ -1,5 +1,22 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.51 lockstep — vault passphrase unlock label + start_node env (8339a37)
+
+Hotfix for node-ui 0.8.50:
+- Unlock screen field renamed from "Wallet Password" to "Vault
+  passphrase", placeholder hints at the 12+ char minimum, and
+  footer copy explicitly references the keystore + first-run
+  setup so operators know which secret to type (`ae30c63`).
+- The 0.8.50 wallet-verify cascade let the legacy password
+  unlock the UI; the subsequent `syn start` spawn then hung on
+  an interactive prompt because the same password couldn't
+  decrypt the keystore. node CLI 0.8.51 drops that cascade and
+  makes `syn start` honour `SYNAPSEIA_WALLET_PASSWORD` env on
+  the keystore branch, so unlock + start are end-to-end clean
+  when the operator types the vault passphrase.
+
+Lockstep with coord + node + node-ui versioned together.
+
 ## [2026-05-15] chore(release): 0.8.50 lockstep — wallet-verify keystore + canonical program constants + README (97c8e70)
 
 Version-only bump. Functional changes live in the node sub-repo
