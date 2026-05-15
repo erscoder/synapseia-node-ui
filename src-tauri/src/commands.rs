@@ -29,6 +29,24 @@ pub const ERR_CLI_MISSING: &str = "ERR_CLI_MISSING";
 /// https://nodejs.org/dist/ at the time of this change.
 const BUNDLED_NODE_VERSION: &str = "22.20.0";
 
+/// The UI build's own version, used as a hard floor in `check_cli_freshness`.
+/// When the installed CLI is strictly older than this, force an upgrade even
+/// if the npm registry is unreachable or returns a lower `latest` (e.g. a
+/// rollback via `npm dist-tag`). Keeps node + node-ui locked at the same
+/// semver — see the lockstep release rule in CLAUDE.md.
+const MIN_NODE_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// npm registry dist-tags endpoint for `@synapseia-network/node`. The path
+/// uses URL-encoded `%2F` because the registry's `/-/package/<name>/dist-tags`
+/// route does not accept the unencoded `/` between scope and name.
+const NPM_DIST_TAGS_URL: &str =
+    "https://registry.npmjs.org/-/package/@synapseia-network%2Fnode/dist-tags";
+
+/// Hard timeout for the npm registry dist-tags fetch. Short on purpose: this
+/// gates a foreground install path. If npm is slow or unreachable the floor
+/// logic (`MIN_NODE_CLI_VERSION`) still produces a correct decision.
+const NPM_DIST_TAGS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Serializes concurrent `install_synapseia_node` invocations so a double-click
 /// on Start can't fire two parallel `npm install -g` runs. The second waiter
 /// re-checks `find_synapseia_node()` after the lock releases and returns the
@@ -1980,9 +1998,11 @@ fn find_synapseia_node(_app: Option<&AppHandle>) -> Result<String, String> {
 }
 
 /// Result of comparing the locally-installed @synapseia-network/node CLI
-/// version against what the coordinator advertises as `latestNodeVersion`.
-/// Used by `install_synapseia_node` to decide whether to short-circuit on
-/// a still-fresh install or to fall through to the npm reinstall path.
+/// version against the npm registry's `latest` dist-tag plus the UI's own
+/// compile-time floor (`MIN_NODE_CLI_VERSION`). Used by
+/// `install_synapseia_node` to decide whether to short-circuit on a still-
+/// fresh install or to fall through to the npm reinstall path.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliFreshness {
     UpToDate { current: String },
     Stale { current: String, latest: String },
@@ -2131,11 +2151,141 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     }
 }
 
-/// Probe whether the existing CLI install is current enough to keep, or
-/// stale enough to trigger an in-place `npm install -g @synapseia-network/node`
-/// re-fetch. Any failure (CLI hang, coord 502, malformed semver) bubbles
-/// up as `Err` so the caller can safely keep the existing install without
-/// blocking the desktop UI on a fragile network round-trip.
+/// Best-effort npm-registry probe for the latest published version of
+/// `@synapseia-network/node`. Returns the `latest` dist-tag on success.
+/// Hard 5 s timeout — see `NPM_DIST_TAGS_TIMEOUT`. Any network / HTTP / parse
+/// failure is folded into a single `Err(String)` so the caller can decide
+/// whether to propagate or fall back to the `MIN_NODE_CLI_VERSION` floor.
+async fn fetch_npm_latest() -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct DistTags {
+        latest: Option<String>,
+    }
+
+    let resp = reqwest::Client::new()
+        .get(NPM_DIST_TAGS_URL)
+        .timeout(NPM_DIST_TAGS_TIMEOUT)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("npm registry request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "npm registry returned status {}",
+            resp.status()
+        ));
+    }
+
+    let tags: DistTags = resp
+        .json()
+        .await
+        .map_err(|e| format!("npm registry response was not JSON: {}", e))?;
+
+    tags.latest
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "npm registry response had no `latest` dist-tag".to_string())
+}
+
+/// Return whichever of `a` / `b` is the larger semver. Ties (or parse
+/// failures inside `semver_lt`) resolve to `a` — the caller always passes the
+/// npm value as `a` and the floor as `b`, so a tie keeps the npm string for
+/// downstream logging.
+fn max_semver<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if semver_lt(a, b) { b } else { a }
+}
+
+/// Pure decision helper for `check_cli_freshness`. Splits the I/O (the npm
+/// probe + the CLI `--version` probe) from the policy so the rules below are
+/// unit-testable without spinning a real HTTP server.
+///
+/// Rules (in order — first match wins):
+///   1. `current < min` → ALWAYS Stale. Target = `max(npm_latest, min)`.
+///      Even if npm is down, we still know we need to upgrade because the
+///      UI was shipped with a newer floor than what's installed.
+///   2. npm reachable (`npm_latest = Some(v)`) AND `current < v` → Stale,
+///      target = `v`. Standard "registry says upgrade" path.
+///   3. npm reachable AND `current >= v` → UpToDate.
+///   4. npm unreachable (`npm_latest = None`) AND `current >= min` → propagate
+///      the npm error so the caller logs "freshness check skipped" and
+///      keeps the existing CLI.
+fn decide_cli_freshness(
+    current: &str,
+    npm_latest: Option<&str>,
+    npm_error: Option<&str>,
+    min: &str,
+) -> Result<CliFreshness, String> {
+    // Defense in depth (reviewer-lessons P2 — fail-closed cross-checks):
+    // `semver_lt` silently treats non-numeric components as 0, so a malformed
+    // `current` like "v0.8.49" or "broken" would compare as (0,0,0). Today
+    // `extract_semver_line` rejects those upstream, but pinning the invariant
+    // here makes the contract explicit and survives a future loosening of
+    // that regex. The `min` side is always `MIN_NODE_CLI_VERSION`
+    // (`env!("CARGO_PKG_VERSION")`) so a malformed value would be a
+    // build-time bug — surface it the same way.
+    if !is_semver(current) {
+        return Err(format!("installed CLI reported malformed semver: {current:?}"));
+    }
+    if !is_semver(min) {
+        return Err(format!("UI floor (MIN_NODE_CLI_VERSION) is malformed: {min:?}"));
+    }
+
+    // Rule 1: below the floor — always upgrade, regardless of npm reachability.
+    if semver_lt(current, min) {
+        let target = match npm_latest {
+            Some(v) => max_semver(v, min).to_string(),
+            None => min.to_string(),
+        };
+        return Ok(CliFreshness::Stale {
+            current: current.to_string(),
+            latest: target,
+        });
+    }
+
+    match npm_latest {
+        Some(v) => {
+            // Rules 2 / 3: npm is the source of truth above the floor.
+            if semver_lt(current, v) {
+                Ok(CliFreshness::Stale {
+                    current: current.to_string(),
+                    latest: v.to_string(),
+                })
+            } else {
+                Ok(CliFreshness::UpToDate {
+                    current: current.to_string(),
+                })
+            }
+        }
+        None => {
+            // Rule 4: above the floor and npm is down — honest "I don't know".
+            Err(npm_error
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "npm registry unreachable".to_string()))
+        }
+    }
+}
+
+/// Decide whether the installed CLI at `node_path` is stale relative to the
+/// latest published `@synapseia-network/node` AND the UI's own compile-time
+/// floor (`MIN_NODE_CLI_VERSION`).
+///
+/// Two probes run sequentially:
+///   1. `<node>/dist/bootstrap.js --version` (or `dist/index.js`) — the
+///      installed CLI's reported version.
+///   2. `https://registry.npmjs.org/-/package/@synapseia-network%2Fnode/dist-tags`
+///      — the registry's `latest` dist-tag.
+///
+/// Decision policy lives in `decide_cli_freshness` (pure, unit-tested):
+///   - Installed `<` UI floor → ALWAYS upgrade (defense in depth: registry
+///     could be unreachable, rolled back, or temporarily lagging behind us).
+///   - Installed `<` npm latest → upgrade to npm latest.
+///   - Installed `>=` floor AND npm down → propagate Err so the caller logs
+///     "freshness check skipped" and keeps the existing CLI.
+///   - Otherwise → UpToDate.
+///
+/// Replaces the previous coord `/version` poll, which was fragile because
+/// `latestNodeVersion` was baked into the coord's Docker image at build time
+/// and could lag the npm publish by an entire `fly deploy` cycle.
 async fn check_cli_freshness(
     _app: &AppHandle,
     node_path: &str,
@@ -2195,37 +2345,22 @@ async fn check_cli_freshness(
         )
     })?;
 
-    // 2. Fetch coord /version with a hard 5s ceiling. A coord outage must
-    //    never freeze the desktop boot — caller treats Err as "keep
-    //    existing CLI".
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        reqwest::get("https://synapseia-coord-http.fly.dev/version"),
-    )
-    .await
-    .map_err(|_| "coord /version timeout".to_string())?
-    .map_err(|e| format!("coord /version fetch: {e}"))?;
-    let info: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("coord /version json: {e}"))?;
-    let latest = info["latestNodeVersion"]
-        .as_str()
-        .ok_or_else(|| "coord /version missing latestNodeVersion".to_string())?
-        .to_string();
-    if latest == "0.0.0" {
-        // Coord deployment missing the LATEST_VERSION build-arg. Treat as
-        // "unknown" and keep the existing CLI rather than reinstalling an
-        // arbitrary `@latest` and pulling a version we can't pin.
-        return Ok(CliFreshness::UpToDate { current });
-    }
+    // 2. Probe the npm registry's `latest` dist-tag. Failure here is folded
+    //    into a structured `(None, Some(err))` tuple so the pure decision
+    //    helper below can still force an upgrade when `current < MIN`.
+    let (npm_latest, npm_error) = match fetch_npm_latest().await {
+        Ok(v) => (Some(v), None),
+        Err(e) => (None, Some(e)),
+    };
 
-    // 3. Compare semver. Stale = strictly lower than coord's `latest`.
-    if semver_lt(&current, &latest) {
-        Ok(CliFreshness::Stale { current, latest })
-    } else {
-        Ok(CliFreshness::UpToDate { current })
-    }
+    // 3. Compare against npm + floor. See `decide_cli_freshness` for the
+    //    full rule table.
+    decide_cli_freshness(
+        &current,
+        npm_latest.as_deref(),
+        npm_error.as_deref(),
+        MIN_NODE_CLI_VERSION,
+    )
 }
 
 /// Pick the last semver-looking line out of a CLI's `--version` stdout.
@@ -2863,5 +2998,122 @@ mod cli_freshness_tests {
     #[test]
     fn extract_semver_rejects_non_semver() {
         assert_eq!(extract_semver_line("hello world"), None);
+    }
+
+    #[test]
+    fn max_semver_picks_larger() {
+        assert_eq!(max_semver("0.8.42", "0.8.50"), "0.8.50");
+        assert_eq!(max_semver("0.8.50", "0.8.42"), "0.8.50");
+        // Tie keeps `a` (the npm-supplied value at the call site).
+        assert_eq!(max_semver("0.8.50", "0.8.50"), "0.8.50");
+    }
+
+    #[test]
+    fn freshness_forces_upgrade_when_below_min_and_npm_down() {
+        let res = decide_cli_freshness("0.8.49", None, Some("npm down"), "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::Stale {
+                current: "0.8.49".to_string(),
+                latest: "0.8.51".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_forces_upgrade_when_below_min_and_npm_rolled_back() {
+        // npm is reachable but reports a version older than the UI's floor
+        // (operator rolled `latest` back via `npm dist-tag`). Floor still wins.
+        let res = decide_cli_freshness("0.8.49", Some("0.8.50"), None, "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::Stale {
+                current: "0.8.49".to_string(),
+                latest: "0.8.51".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_uses_npm_target_when_below_min_and_npm_ahead() {
+        let res = decide_cli_freshness("0.8.49", Some("0.9.0"), None, "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::Stale {
+                current: "0.8.49".to_string(),
+                latest: "0.9.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_up_to_date_when_at_min_and_npm_matches() {
+        let res = decide_cli_freshness("0.8.51", Some("0.8.51"), None, "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::UpToDate {
+                current: "0.8.51".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_stale_when_at_min_and_npm_ahead() {
+        let res = decide_cli_freshness("0.8.51", Some("0.9.0"), None, "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::Stale {
+                current: "0.8.51".to_string(),
+                latest: "0.9.0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_propagates_err_when_above_min_and_npm_down() {
+        let err =
+            decide_cli_freshness("0.9.0", None, Some("registry timeout"), "0.8.51").unwrap_err();
+        assert_eq!(err, "registry timeout");
+    }
+
+    #[test]
+    fn freshness_up_to_date_when_above_min_and_npm_equal() {
+        let res = decide_cli_freshness("0.9.0", Some("0.9.0"), None, "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::UpToDate {
+                current: "0.9.0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_below_min_with_npm_exactly_at_min() {
+        // npm reachable and reports exactly the floor. Target must resolve to
+        // the floor (tie via max_semver keeps the npm-supplied string, which
+        // equals min) — never below.
+        let res = decide_cli_freshness("0.8.49", Some("0.8.51"), None, "0.8.51").unwrap();
+        assert_eq!(
+            res,
+            CliFreshness::Stale {
+                current: "0.8.49".to_string(),
+                latest: "0.8.51".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_rejects_malformed_current() {
+        let err = decide_cli_freshness("v0.8.49", Some("0.8.51"), None, "0.8.51").unwrap_err();
+        assert!(err.contains("malformed semver"), "unexpected error: {err}");
+        // Also test fully non-numeric garbage.
+        let err = decide_cli_freshness("nightly", None, None, "0.8.51").unwrap_err();
+        assert!(err.contains("malformed semver"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn freshness_rejects_malformed_min() {
+        let err = decide_cli_freshness("0.8.49", Some("0.8.51"), None, "not-a-version").unwrap_err();
+        assert!(err.contains("MIN_NODE_CLI_VERSION"), "unexpected error: {err}");
     }
 }
