@@ -1979,6 +1979,15 @@ fn find_synapseia_node(_app: Option<&AppHandle>) -> Result<String, String> {
     ))
 }
 
+/// Result of comparing the locally-installed @synapseia-network/node CLI
+/// version against what the coordinator advertises as `latestNodeVersion`.
+/// Used by `install_synapseia_node` to decide whether to short-circuit on
+/// a still-fresh install or to fall through to the npm reinstall path.
+enum CliFreshness {
+    UpToDate { current: String },
+    Stale { current: String, latest: String },
+}
+
 #[tauri::command]
 pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     // Acquire BEFORE the early-return check so concurrent callers serialize.
@@ -1987,14 +1996,46 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     let _guard = install_lock().lock().await;
 
     if let Ok(path) = find_synapseia_node(Some(&app)) {
-        let _ = app.emit(
-            "install-progress",
-            InstallProgress {
-                phase: "already-installed",
-                message: "@synapseia-network/node already installed".to_string(),
-            },
-        );
-        return Ok(path);
+        // Decide whether the existing install is current enough. On any error
+        // from the version probe we fall back to the legacy
+        // "already-installed" short-circuit so a transient coord 502 (or a
+        // missing `node` binary, or a CLI that hangs on `--version`) never
+        // blocks the desktop UI from booting.
+        match check_cli_freshness(&app, &path).await {
+            Ok(CliFreshness::UpToDate { current }) => {
+                let _ = app.emit(
+                    "install-progress",
+                    InstallProgress {
+                        phase: "already-installed",
+                        message: format!("CLI already up-to-date (v{current})"),
+                    },
+                );
+                return Ok(path);
+            }
+            Ok(CliFreshness::Stale { current, latest }) => {
+                let _ = app.emit(
+                    "install-progress",
+                    InstallProgress {
+                        phase: "upgrading",
+                        message: format!("CLI v{current} -> v{latest}, upgrading..."),
+                    },
+                );
+                // Fall through to the npm install -g path below. The lock is
+                // still held so a concurrent caller will observe the upgrade
+                // on its post-wait `find_synapseia_node` re-check.
+            }
+            Err(err) => {
+                eprintln!("[install] freshness check failed: {err}; keeping existing CLI");
+                let _ = app.emit(
+                    "install-progress",
+                    InstallProgress {
+                        phase: "already-installed",
+                        message: "CLI present, freshness check skipped".to_string(),
+                    },
+                );
+                return Ok(path);
+            }
+        }
     }
 
     let node_bin = match ensure_node_runtime(&app).await {
@@ -2088,6 +2129,136 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
                 .to_string(),
         ),
     }
+}
+
+/// Probe whether the existing CLI install is current enough to keep, or
+/// stale enough to trigger an in-place `npm install -g @synapseia-network/node`
+/// re-fetch. Any failure (CLI hang, coord 502, malformed semver) bubbles
+/// up as `Err` so the caller can safely keep the existing install without
+/// blocking the desktop UI on a fragile network round-trip.
+async fn check_cli_freshness(
+    _app: &AppHandle,
+    node_path: &str,
+) -> Result<CliFreshness, String> {
+    // 1. Spawn the CLI's `--version` probe via the same node binary that
+    //    `build_node_command` would use at runtime, so we exercise the same
+    //    code path (matters for the bundled-runtime case where the system
+    //    PATH may not see ~/.synapseia/node/bin/node).
+    let node_bin = locate_node_binary()
+        .or_else(|| {
+            let bundled = bundled_node_bin_path();
+            if bundled.exists() { Some(bundled) } else { None }
+        })
+        .ok_or_else(|| "node binary not found".to_string())?;
+    let bootstrap_path = format!("{}/dist/bootstrap.js", node_path);
+    let script_path = if std::path::Path::new(&bootstrap_path).exists() {
+        bootstrap_path
+    } else {
+        format!("{}/dist/index.js", node_path)
+    };
+
+    let node_bin_owned = node_bin.clone();
+    let script_owned = script_path.clone();
+    let path_env = if let Some(parent) = node_bin.parent() {
+        format!("{}:{}", parent.to_string_lossy(), augmented_path())
+    } else {
+        augmented_path()
+    };
+    let path_env_owned = path_env.clone();
+
+    let version_join = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(&node_bin_owned)
+                .arg(&script_owned)
+                .arg("--version")
+                .env("PATH", path_env_owned)
+                .output()
+        }),
+    )
+    .await
+    .map_err(|_| "--version probe timed out after 30s".to_string())?
+    .map_err(|e| format!("failed to join --version task: {e}"))?
+    .map_err(|e| format!("failed to spawn --version probe: {e}"))?;
+
+    if !version_join.status.success() {
+        return Err(format!(
+            "--version exit {:?}",
+            version_join.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&version_join.stdout);
+    let current = extract_semver_line(&stdout).ok_or_else(|| {
+        format!(
+            "could not parse --version stdout: {}",
+            stdout.chars().take(200).collect::<String>()
+        )
+    })?;
+
+    // 2. Fetch coord /version with a hard 5s ceiling. A coord outage must
+    //    never freeze the desktop boot — caller treats Err as "keep
+    //    existing CLI".
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reqwest::get("https://synapseia-coord-http.fly.dev/version"),
+    )
+    .await
+    .map_err(|_| "coord /version timeout".to_string())?
+    .map_err(|e| format!("coord /version fetch: {e}"))?;
+    let info: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("coord /version json: {e}"))?;
+    let latest = info["latestNodeVersion"]
+        .as_str()
+        .ok_or_else(|| "coord /version missing latestNodeVersion".to_string())?
+        .to_string();
+    if latest == "0.0.0" {
+        // Coord deployment missing the LATEST_VERSION build-arg. Treat as
+        // "unknown" and keep the existing CLI rather than reinstalling an
+        // arbitrary `@latest` and pulling a version we can't pin.
+        return Ok(CliFreshness::UpToDate { current });
+    }
+
+    // 3. Compare semver. Stale = strictly lower than coord's `latest`.
+    if semver_lt(&current, &latest) {
+        Ok(CliFreshness::Stale { current, latest })
+    } else {
+        Ok(CliFreshness::UpToDate { current })
+    }
+}
+
+/// Pick the last semver-looking line out of a CLI's `--version` stdout.
+/// The bootstrap's logger emits two INFO lines before the version prints,
+/// so the version is the LAST non-empty line that matches `^\d+\.\d+\.\d+$`
+/// after ANSI escape stripping.
+fn extract_semver_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(|l| strip_ansi(l).trim().to_string())
+        .filter(|l| is_semver(l))
+        .last()
+}
+
+fn is_semver(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Strict `<` comparison on dotted-numeric semver, ignoring any prerelease
+/// / build metadata (the CLI only ships clean `X.Y.Z` tags).
+fn semver_lt(a: &str, b: &str) -> bool {
+    let to_tuple = |s: &str| -> (u64, u64, u64) {
+        let p: Vec<u64> = s.split('.').filter_map(|x| x.parse().ok()).collect();
+        (
+            *p.first().unwrap_or(&0),
+            *p.get(1).unwrap_or(&0),
+            *p.get(2).unwrap_or(&0),
+        )
+    };
+    to_tuple(a) < to_tuple(b)
 }
 
 /// Strip lines containing well-known transitive-dependency warnings from a
@@ -2652,5 +2823,45 @@ mod self_update_tests {
             assert!(g.cached_password.is_none());
             assert!(!g.pending_self_update_restart);
         });
+    }
+}
+
+#[cfg(test)]
+mod cli_freshness_tests {
+    //! Unit tests for the semver/ANSI helpers backing the freshness probe
+    //! that `install_synapseia_node` runs before short-circuiting on an
+    //! existing CLI install. The network/process-spawn branches are
+    //! integration territory and not exercised here.
+    use super::*;
+
+    #[test]
+    fn semver_lt_basic() {
+        assert!(semver_lt("0.8.36", "0.8.42"));
+        assert!(!semver_lt("0.8.42", "0.8.42"));
+        assert!(!semver_lt("0.8.43", "0.8.42"));
+    }
+
+    #[test]
+    fn semver_lt_minor_major() {
+        assert!(semver_lt("0.7.99", "0.8.0"));
+        assert!(semver_lt("0.9.99", "1.0.0"));
+    }
+
+    #[test]
+    fn strip_ansi_basic() {
+        assert_eq!(strip_ansi("\x1b[32mhello\x1b[0m"), "hello");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn extract_semver_picks_last_semver_line() {
+        let stdout =
+            "\x1b[90m10:00:00.000\x1b[0m  \x1b[32mINFO\x1b[0m  Booting\n0.8.42\n";
+        assert_eq!(extract_semver_line(stdout), Some("0.8.42".to_string()));
+    }
+
+    #[test]
+    fn extract_semver_rejects_non_semver() {
+        assert_eq!(extract_semver_line("hello world"), None);
     }
 }

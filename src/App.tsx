@@ -14,6 +14,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { LogViewer } from "./components/LogViewer";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { BetaLimitModal } from "./components/BetaLimitModal";
+import { CliUpdateOverlay } from "./components/CliUpdateOverlay";
 import { useUpdateChecker } from "./hooks/useUpdateChecker";
 
 export type Panel = "my-node" | "wallet" | "stake" | "system" | "settings" | "logs";
@@ -83,7 +84,7 @@ export interface ChainInfo {
 
 type BootPhase = "checking" | "needs-create" | "needs-unlock" | "unlocked" | "needs-activation" | "installing-node";
 
-function App() {
+function AppInner() {
   const [bootPhase, setBootPhase] = useState<BootPhase>("checking");
   const [password, setPassword] = useState<string | null>(null);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
@@ -469,6 +470,15 @@ function App() {
         )}
       </main>
     </div>
+  );
+}
+
+function App() {
+  return (
+    <>
+      <AppInner />
+      <CliUpdateOverlay />
+    </>
   );
 }
 
