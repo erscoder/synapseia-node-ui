@@ -1,5 +1,18 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.50 lockstep — wallet-verify keystore + canonical program constants + README (97c8e70)
+
+Version-only bump. Functional changes live in the node sub-repo
+(`f9544ba0` wallet-verify keystore-first, `188d0258` staking-cli
+COORDINATOR_URL default + user ATA create, `d033a614`
+`constants/programs.ts` + README keystore docs). Lockstep keeps
+coord + node + node-ui versioned together.
+
+Operators upgrading 0.8.49 → 0.8.50 on macOS / Windows: the
+unlock screen now accepts the vault passphrase you set during
+`syn start` migration — no more legacy password prompt after
+migrating to the keystore.
+
 ## [2026-05-15] chore(release): 0.8.49 lockstep — staking-cli keystore + self-updater prefix (066b386)
 
 Version-only bump. Functional changes live in the node sub-repo
