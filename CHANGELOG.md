@@ -1,5 +1,18 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.52 lockstep — node-ui auto-update via npm registry (f67ba91)
+
+Ships `4cfe1f7`: `install_synapseia_node`'s freshness check now
+queries the npm registry directly instead of the coordinator's
+`/version` endpoint, plus a compile-time floor
+`MIN_NODE_CLI_VERSION = env!("CARGO_PKG_VERSION")` that forces an
+upgrade whenever the UI build is ahead of the installed CLI even
+when npm is unreachable.
+
+Lockstep with coord + node + node-ui versioned together
+(`packages/coordinator` `a434d55a`, `packages/node` `6fbb6931`,
+`packages/node-ui` `f67ba91`).
+
 ## [2026-05-15] fix(install): query npm registry for latest CLI version instead of coord (4cfe1f7)
 
 `install_synapseia_node`'s freshness check used to poll
