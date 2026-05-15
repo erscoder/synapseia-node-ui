@@ -1,5 +1,15 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): 0.8.44 lockstep — Linux GPU pod hardware-detect hotfix (a04fffc)
+
+Version-only bump. Functional change lives in the node sub-repo
+(`1f2f8857` — bare-number nvidia-smi parse fallback). Lockstep
+keeps coord + node + node-ui versioned together.
+
+Operators upgrading 0.8.43 → 0.8.44 on macOS / Windows see no
+behavioral change; the auto-upgrade-at-boot flow added in 0.8.43
+will pick up the new CLI on the next start.
+
 ## [2026-05-15] feat(boot): auto-upgrade stale node CLI at app launch + spinner overlay (44472da)
 
 Reported by a Windows operator: friend opened the desktop app, picked
