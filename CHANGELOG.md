@@ -1,5 +1,20 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] chore(release): bump 0.8.53 lockstep (582b33f)
+
+Version-only bump to keep `node-ui` in lockstep sync with `node`
+and `coordinator` (memory `feedback_version_sync`). No functional
+changes in this Tauri app.
+
+The bundled CLI (`@synapseia-network/node@0.8.53`) ships the new
+docking auto-install primitive (`installDockingDeps()`), so GPU
+operators who upgrade node-ui will get Vina + Open Babel auto-
+installed on their next `syn start` — no manual `apt install` /
+`brew install` step needed.
+
+Tag pushed as `node-ui-v0.8.53` to trigger `release.yml` which
+builds DMG/MSI/AppImage assets and publishes the GH release.
+
 ## [2026-05-15] chore(release): 0.8.52 lockstep — node-ui auto-update via npm registry (f67ba91)
 
 Ships `4cfe1f7`: `install_synapseia_node`'s freshness check now
