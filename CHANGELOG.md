@@ -1,5 +1,42 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] fix(install): query npm registry for latest CLI version instead of coord (4cfe1f7)
+
+`install_synapseia_node`'s freshness check used to poll
+`https://synapseia-coord-http.fly.dev/version`, whose
+`latestNodeVersion` field is baked into the coordinator's Docker
+image at build time. Any npm publish that landed before a coord
+`fly deploy` left the UI advertising the prior version and skipping
+the auto-upgrade. Hit live on macOS — UI 0.8.51 kept running
+against CLI 0.8.49 for hours.
+
+`check_cli_freshness` now queries the npm registry directly at
+`https://registry.npmjs.org/-/package/@synapseia-network%2Fnode/dist-tags`
+(5 s timeout, single ~30-byte response). Two layers of safety:
+
+- Compile-time floor `MIN_NODE_CLI_VERSION = env!("CARGO_PKG_VERSION")`
+  forces an upgrade whenever the UI build is ahead of the installed
+  CLI, even if the registry is unreachable or rolled back via
+  `npm dist-tag`.
+- Pure `decide_cli_freshness` helper implements the four-rule
+  decision table (below-floor → always Stale; npm reachable →
+  compare; npm down above floor → propagate Err so the caller
+  keeps the existing CLI).
+
+Reviewer-lesson P2 applied: `decide_cli_freshness` rejects malformed
+`current` / `min` semver inputs explicitly at the top, so a future
+loosening of `extract_semver_line`'s regex can't flip the floor
+check into fail-open.
+
+Tests: 10 new in `mod cli_freshness_tests` covering every rule,
+both malformed-input paths, the tie-resolution in `max_semver`,
+and the below-floor + npm-at-floor edge case. 35 passed total
+(up from 25).
+
+Coord `/version` continues to serve `minNodeVersion` for the
+protocol-floor compatibility gate; this commit only stops relying
+on it for the auto-upgrade trigger.
+
 ## [2026-05-15] chore(release): 0.8.51 lockstep — vault passphrase unlock label + start_node env (8339a37)
 
 Hotfix for node-ui 0.8.50:
