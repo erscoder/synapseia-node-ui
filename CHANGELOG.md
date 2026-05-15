@@ -1,5 +1,45 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-15] feat(boot): auto-upgrade stale node CLI at app launch + spinner overlay (44472da)
+
+Reported by a Windows operator: friend opened the desktop app, picked
+NVIDIA NIM in Settings, save failed with `Invalid model format. Got:
+nvidia/meta/llama-3.2-3b-instruct`. Root cause: stale CLI 0.8.36 with
+the multi-slash regex bug (fixed in node 0.8.37+). The CLI's own
+preflight self-update only fires when `synapseia start` boots, but
+the operator hit the Settings error BEFORE clicking Start — and
+`install_synapseia_node` short-circuited `already installed` without
+a version check, so there was no other code path to upgrade.
+
+Fix: extend `install_synapseia_node` so the existing-install branch
+runs a freshness check before the short-circuit:
+
+1. Probe `synapseia --version` on the located CLI (30 s timeout).
+2. Fetch coord `/version` (5 s timeout) for `latestNodeVersion`.
+3. `semver_lt(current, latest)` → fall through to the existing
+   `npm install -g` path
+   (`NPM_CONFIG_PREFIX=~/.synapseia/npm-global`, already wired).
+   `semver >=` → keep current install.
+
+Defensive defaults so a coord outage NEVER blocks the boot:
+
+- coord timeout / fetch error → keep current CLI.
+- coord returns `latestNodeVersion=0.0.0` (build-arg unset) → keep
+  current CLI; we will not reinstall to an unknown `latest`.
+- `--version` parse failure → keep current CLI.
+
+UI: new `CliUpdateOverlay` listens to the existing `install-progress`
+Tauri event and renders a non-dismissable spinner while a
+non-terminal phase (`upgrading`, `downloading-node`, `extracting`,
+`installing-npm-package`) is in flight. Mounted at the root of
+`App.tsx` so it sits above every panel.
+
+Tests: 5 new cargo unit tests in `cli_freshness_tests`. Full
+suites: cargo 24/24 green, vitest 6/6 green, pnpm build green.
+
+Version: 0.8.42 -> 0.8.43 (lockstep with coord + node).
+
+
 ## [2026-05-14] chore(release): 0.8.42 lockstep bump for node banner ASCII fix (f5ffda3)
 
 Version-only bump. Node-ui has no functional change in this
