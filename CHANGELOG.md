@@ -1,5 +1,9 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-16] chore(release): bump 0.8.58 lockstep (751ca75)
+
+Lockstep with sub node `6248db06`. No node-ui code change this cycle.
+
 ## [2026-05-16] chore(release): bump 0.8.57 lockstep (22532a1)
 
 Lockstep with sub node `f1ff856b` (terminal UX fixes). No node-ui
