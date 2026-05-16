@@ -67,6 +67,15 @@ fn node_runtime_lock() -> &'static tokio::sync::Mutex<()> {
     NODE_RUNTIME_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Serializes concurrent `install_python_deps` invocations so a double-click
+/// on the loading screen can't fire two parallel pip-install runs. Separate
+/// from INSTALL_LOCK / NODE_RUNTIME_LOCK because those guard the CLI npm
+/// install / bundled node download — Python deps are an orthogonal step.
+static PYTHON_INSTALL_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn python_install_lock() -> &'static tokio::sync::Mutex<()> {
+    PYTHON_INSTALL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Commands that send on-chain transactions and must use the longer timeout.
 const ON_CHAIN_COMMANDS: &[&str] = &[
     "stake",
@@ -2104,6 +2113,21 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
     })
     .await;
 
+    // Force `npm install -g` to land in the SAME user-prefix that
+    // `find_synapseia_node` searches first (`~/.synapseia/npm-global`).
+    // Without `NPM_CONFIG_PREFIX`, the install goes to the bundled-Node
+    // default prefix (`~/.synapseia/node/lib/node_modules/...`) while
+    // the locator still prefers the user-prefix copy. When an older CLI
+    // already lives in user-prefix from a prior `npm install -g` or from
+    // the CLI's own self-update, the next start spawns the stale user-prefix
+    // copy, hits `preflightVersionCheck`, and triggers ANOTHER self-update
+    // — producing the double-update loop the operator saw at 0.8.53 -> 0.8.54.
+    let user_prefix = dirs::home_dir()
+        .map(|h| h.join(".synapseia/npm-global"))
+        .ok_or_else(|| "Could not resolve home dir".to_string())?;
+    let _ = std::fs::create_dir_all(&user_prefix);
+    let user_prefix_str = user_prefix.to_string_lossy().to_string();
+
     let install_result = tokio::task::spawn_blocking(move || {
         std::process::Command::new(&npm_bin)
             .arg("install")
@@ -2111,6 +2135,7 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
             .arg("--force")
             .arg("@synapseia-network/node")
             .env("PATH", path_env)
+            .env("NPM_CONFIG_PREFIX", user_prefix_str)
             .output()
     })
     .await
@@ -2148,6 +2173,133 @@ pub async fn install_synapseia_node(app: AppHandle) -> Result<String, String> {
             "Install reported success but @synapseia-network/node not found. Try restarting the app."
                 .to_string(),
         ),
+    }
+}
+
+/// Phase event mirrored from the node CLI's `installPythonDeps` helper
+/// (packages/node/src/utils/install-deps.ts). Field shape MUST match the
+/// TypeScript `InstallDepsEvent` interface for the frontend subscriber to
+/// destructure cleanly.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct PythonInstallProgress {
+    phase: String,
+    status: String,
+    message: String,
+}
+
+/// Run `syn install-deps` and stream phase events to the desktop UI.
+///
+/// Invoked by the loading screen so by the time the wallet unlock screen
+/// appears, Python deps (venv + torch + LoRA stack + bitsandbytes) are
+/// ready and clicking Start launches the node immediately without an
+/// extra install delay.
+///
+/// Contract with the CLI: stdout lines prefixed with `[INSTALL_PROGRESS] `
+/// carry a single-line JSON-encoded `PythonInstallProgress`. The remaining
+/// stdout is forwarded as raw `node-log` events so operators can still see
+/// pip output in the log panel. The CLI ALWAYS emits a final event with
+/// `phase: "complete"`, but we also emit one ourselves on process exit so
+/// the frontend can rely on receiving a terminal event even if the CLI
+/// crashes before its own final emit.
+#[tauri::command]
+pub async fn install_python_deps(app: AppHandle) -> Result<String, String> {
+    // Serialize concurrent invocations — frontend should only ever fire one,
+    // but double-mount or rapid remount on the loading screen could
+    // otherwise spawn two parallel pip-install runs.
+    let _guard = python_install_lock().lock().await;
+
+    let mut cmd = build_node_command(Some(&app), &["install-deps"])?;
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Non-interactive: the desktop spawn has no TTY. The CLI helper
+        // already uses `stdio: 'pipe'` for pip subprocesses, so this just
+        // hardens the contract.
+        .env("CI", "1");
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn install-deps process: {}", e))?;
+
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    if let Some(stdout) = child_stdout {
+        let app_out = app.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(raw)) = reader.next_line().await {
+                if let Some(rest) = raw.strip_prefix("[INSTALL_PROGRESS] ") {
+                    match serde_json::from_str::<PythonInstallProgress>(rest) {
+                        Ok(event) => {
+                            let _ = app_out.emit("python-install-progress", &event);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[install_python_deps] failed to parse progress line: {} ({})",
+                                e, rest
+                            );
+                        }
+                    }
+                } else {
+                    // Forward non-progress stdout as a log line so operators
+                    // can still see pip output in the log panel.
+                    let log = LogLine {
+                        timestamp: now_hhmmss(),
+                        level: "info".to_string(),
+                        message: raw,
+                    };
+                    let _ = app_out.emit("node-log", &log);
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = child_stderr {
+        let app_err = app.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(raw)) = reader.next_line().await {
+                let log = LogLine {
+                    timestamp: now_hhmmss(),
+                    level: "warn".to_string(),
+                    message: raw,
+                };
+                let _ = app_err.emit("node-log", &log);
+            }
+        });
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("install-deps process failed: {}", e))?;
+
+    // Safety-net terminal event. The CLI helper already emits a `complete`
+    // event itself, but if it crashes mid-flight (or before its first emit)
+    // the frontend would hang on the loading screen waiting for a terminal
+    // event that never arrives.
+    if status.success() {
+        let _ = app.emit(
+            "python-install-progress",
+            PythonInstallProgress {
+                phase: "complete".to_string(),
+                status: "done".to_string(),
+                message: "Python deps install finished".to_string(),
+            },
+        );
+        Ok("install-deps completed successfully".to_string())
+    } else {
+        let code = status.code().unwrap_or(-1);
+        let msg = format!("install-deps exited with code {}", code);
+        let _ = app.emit(
+            "python-install-progress",
+            PythonInstallProgress {
+                phase: "complete".to_string(),
+                status: "error".to_string(),
+                message: msg.clone(),
+            },
+        );
+        Err(msg)
     }
 }
 

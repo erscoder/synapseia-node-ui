@@ -15,6 +15,13 @@ import { LogViewer } from "./components/LogViewer";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { BetaLimitModal } from "./components/BetaLimitModal";
 import { CliUpdateOverlay } from "./components/CliUpdateOverlay";
+import {
+  PythonDepsProgress,
+  subscribePythonInstall,
+  upsertPhase,
+  type PythonInstallProgress,
+  type PythonInstallStatus,
+} from "./components/PythonDepsProgress";
 import { useUpdateChecker } from "./hooks/useUpdateChecker";
 
 export type Panel = "my-node" | "wallet" | "stake" | "system" | "settings" | "logs";
@@ -99,6 +106,15 @@ function AppInner() {
   // mutex on the install path; this ref short-circuits at the UI boundary so
   // we don't even round-trip to the backend.
   const installingRef = useRef(false);
+  // Re-entrancy guard for `install_python_deps`: React 18 StrictMode runs
+  // effects twice in dev, and we must not double-invoke the Rust command
+  // (which would race two pip processes against the same venv).
+  const pythonInstallTriggeredRef = useRef(false);
+  // Live phase stream from the Rust side. `terminal` is set when the
+  // backend emits the final `complete` event — that's the signal to route
+  // forward past the loading screen.
+  const [pythonPhases, setPythonPhases] = useState<PythonInstallProgress[]>([]);
+  const [pythonTerminal, setPythonTerminal] = useState<PythonInstallStatus | null>(null);
 
   // Reset scroll to the top whenever the active panel changes. Without this
   // the <main> container keeps its previous scrollTop, so switching into a
@@ -151,6 +167,58 @@ function AppInner() {
         setInstallError(msg);
       }
 
+      // Kick off Python deps install (idempotent on the Rust side; emits
+      // `python-install-progress` events that drive the in-screen list).
+      // Don't block the wallet check on it here — the parent effect below
+      // gates `setBootPhase` on `pythonTerminal !== null` so the loading
+      // screen stays visible until the stream ends.
+      if (!pythonInstallTriggeredRef.current) {
+        pythonInstallTriggeredRef.current = true;
+        try {
+          await invoke<string>("install_python_deps");
+        } catch (e) {
+          // Tauri command failures (channel error, command missing, etc.)
+          // mark the section as errored so the user sees feedback even
+          // when the backend never gets to emit a `complete` event.
+          const msg = e instanceof Error ? e.message : String(e);
+          console.warn("[boot] install_python_deps failed:", msg);
+          setPythonPhases((prev) =>
+            upsertPhase(prev, { phase: "complete", status: "error", message: msg }),
+          );
+          setPythonTerminal("error");
+        }
+      }
+    })();
+  }, []);
+
+  // Subscribe to the python-install-progress stream once. Lives in its own
+  // effect so it stays mounted across StrictMode double-invokes.
+  useEffect(() => {
+    const unlisten = subscribePythonInstall((payload) => {
+      // `complete` and `skipped` are terminal signals — capture the final
+      // status and don't render them as their own row (the rows above
+      // already show every phase's outcome). `skipped` on its own (without
+      // any prior rows) is the "nothing to do" path; PythonDepsProgress
+      // detects that and renders a single one-liner.
+      if (payload.phase === "complete" || payload.phase === "skipped") {
+        setPythonTerminal(payload.status);
+        return;
+      }
+      setPythonPhases((prev) => upsertPhase(prev, payload));
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Gate the transition out of `installing-node` on the python install
+  // terminal signal. Once `pythonTerminal` is set (done/error/skip) we
+  // move forward — `error` still routes forward so a missing Python venv
+  // doesn't lock the user out (some WO types just won't be available).
+  useEffect(() => {
+    if (bootPhase !== "installing-node") return;
+    if (pythonTerminal === null) return;
+    (async () => {
       try {
         const info = await invoke<WalletExistsResult>("wallet_exists");
         setBootPhase(info.exists ? "needs-unlock" : "needs-create");
@@ -159,7 +227,7 @@ function AppInner() {
         setBootPhase("needs-create");
       }
     })();
-  }, []);
+  }, [bootPhase, pythonTerminal]);
 
   useEffect(() => {
     const unlisten = listen<LogLine>("node-log", (event) => {
@@ -349,6 +417,7 @@ function AppInner() {
           <div className="h-12 w-12 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
           <h1 className="text-lg font-semibold">Setting up Synapseia node</h1>
           <p className="text-sm text-slate-400 text-center">{installProgress || "Installing @synapseia-network/node CLI from npm…"}</p>
+          <PythonDepsProgress phases={pythonPhases} terminal={pythonTerminal} />
           {installError && (
             <div className="mt-4 w-full rounded border border-red-500/40 bg-red-500/10 p-4 text-xs text-red-300 whitespace-pre-line">
               <p className="font-semibold mb-1">Installation failed</p>
@@ -376,12 +445,33 @@ function AppInner() {
     );
   }
 
+  // Surfaced below CreateNodeScreen/UnlockScreen when Python deps install
+  // hit an error. We don't block the user (some WO types just won't be
+  // available) but they deserve a heads-up + the retry path.
+  const pythonWarning =
+    pythonTerminal === "error" ? (
+      <div className="mx-auto mt-3 max-w-md rounded border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-xs text-amber-200">
+        Python deps install had errors. Some work order types may not be available. Re-run from
+        the menu to retry.
+      </div>
+    ) : null;
+
   if (bootPhase === "needs-create") {
-    return <CreateNodeScreen onCreated={handleCreated} />;
+    return (
+      <>
+        <CreateNodeScreen onCreated={handleCreated} />
+        {pythonWarning}
+      </>
+    );
   }
 
   if (bootPhase === "needs-unlock") {
-    return <UnlockScreen onUnlock={handleUnlock} />;
+    return (
+      <>
+        <UnlockScreen onUnlock={handleUnlock} />
+        {pythonWarning}
+      </>
+    );
   }
 
   if (bootPhase === "needs-activation" && walletAddress && password) {
