@@ -1,5 +1,29 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-16] feat(node-ui): boot-time Python deps install + 0.8.55 (d77cdc7)
+
+Loading screen now installs ALL Python deps (torch + LoRA stack +
+docking) BEFORE the wallet unlock screen. Operator clicks Start and
+the node boots immediately — no more install logs spamming the
+post-Start console.
+
+- New `install_python_deps` Tauri command spawns the CLI's
+  `install-deps` subcommand and streams progress via
+  `python-install-progress` events.
+- New `<PythonDepsProgress />` React component renders one row per
+  phase (venv, torch, lora-stack, cuda-probe, bitsandbytes, docking,
+  complete) with status icon + live message.
+- `install_synapseia_node` now sets `NPM_CONFIG_PREFIX` to
+  `$HOME/.synapseia/npm-global` so the CLI install lands in the same
+  prefix `find_synapseia_node` prefers. Fixes the double-update loop
+  on first 0.8.53 → 0.8.54 upgrade.
+- Boot effect routes to wallet unlock only after the final
+  `complete` event fires. Errors don't block routing — operator
+  sees an amber warning banner instead.
+
+Version bump 0.8.54 → 0.8.55. Lockstep with sub coord + node
+(`4c9ead22`).
+
 ## [2026-05-16] chore(release): bump 0.8.54 lockstep (ecd56e1)
 
 Lockstep release. No node-ui-specific code change this cycle —
