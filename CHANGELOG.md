@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-16] chore(release): bump 0.8.56 lockstep (17d3b9d)
+
+Lockstep with sub node `f87edbc9` (getModelByName ollamaTag fix).
+No node-ui code change this cycle.
+
 ## [2026-05-16] feat(node-ui): boot-time Python deps install + 0.8.55 (d77cdc7)
 
 Loading screen now installs ALL Python deps (torch + LoRA stack +
