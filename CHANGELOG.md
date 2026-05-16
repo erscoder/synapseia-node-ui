@@ -1,5 +1,11 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-16] chore(release): bump 0.8.60 lockstep with sub node (69a896a)
+
+Lockstep with sub node `e5951cb1` (docking timeout 180 s, embedding
+auto-pull on 404, training LLM resolver gemma3:12b + embedding
+exclusion). No node-ui code change.
+
 ## [2026-05-16] chore(release): bump 0.8.59 lockstep with sub node (eca3902)
 
 Lockstep with sub node `d372dc52` (npm registry as latestVersion
