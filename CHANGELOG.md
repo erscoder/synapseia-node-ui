@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-16] chore(release): bump 0.8.54 lockstep (ecd56e1)
+
+Lockstep release. No node-ui-specific code change this cycle —
+desktop app picks up the bundled CLI improvements from node `a5ed81ff`
+(syn start crash fix + LoRA cap probes + clear deps error). Operators
+upgrading from 0.8.53 get LoRA capability automatically (install flow
+adds `transformers peft datasets safetensors accelerate` on Tier 1+
+nodes) without extra steps.
+
 ## [2026-05-15] chore(release): bump 0.8.53 lockstep (582b33f)
 
 Version-only bump to keep `node-ui` in lockstep sync with `node`
