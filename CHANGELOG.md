@@ -1,5 +1,13 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-16] chore(release): bump 0.8.59 lockstep with sub node (eca3902)
+
+Lockstep with sub node `d372dc52` (npm registry as latestVersion
+source — coord version decoupled). No node-ui code change this cycle.
+
+First release under the new decoupled rule: coord stays on 0.8.58,
+only node + node-ui bump to 0.8.59. No Fly redeploy this cycle.
+
 ## [2026-05-16] chore(release): bump 0.8.58 lockstep (751ca75)
 
 Lockstep with sub node `6248db06`. No node-ui code change this cycle.
