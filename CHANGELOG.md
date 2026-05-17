@@ -1,5 +1,40 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] feat(node-ui): lock-conflict banner + take-over flow (cc332dc)
+
+When `~/.synapseia/node.lock` exists (CLI running, another desktop
+window, or stale from a crashed run), the Start button used to fail
+silently — `start_node` returned an error that App.tsx logged via
+`console.error` and swallowed. Operators saw "click does nothing"
+with no UI feedback.
+
+Adds persistent banner above Start button surfacing 3 states:
+- **CLI alive**: amber, "Node already running from CLI", PID + age,
+  **Take over** CTA.
+- **UI alive** (another window): amber, **Stop other window** CTA.
+- **Stale lock** (PID dead): red, **Clean lock** CTA.
+
+Two new Tauri commands:
+- `check_external_lock` — polls `~/.synapseia/node.lock` every 3s,
+  probes alive state via direct `libc::kill(pid, 0)` syscall (~1µs vs
+  ~10-30ms `/bin/kill` fork+exec).
+- `force_release_lock` — SIGTERM → 250ms poll up to 5s → SIGKILL
+  fallback → re-reads lock to verify PID match before signal
+  (fail-closed identity check: prevents killing a recycled PID if the
+  original CLI exited cleanly between read + kill). Idempotent on
+  missing file.
+
+App.tsx also surfaces previously-swallowed `handleStartNode` errors
+via new `startError` state — race-window errors that escape the
+banner poll still get reported. `MyNodePanel` gets `startDisabled`
+prop showing "Locked" label + disabled state; keyboard Enter blocked.
+
+Tests: 23 vitest (useExternalLock + LockBanner: polling, unmount
+cleanup, all 3 banner states, ARIA role=alert) + 9 cargo
+external_lock_tests (live PID via std::process::id(), dead PID via 0,
+missing file, idempotent release, PID-changed-mid-release fail-closed
+branch). 43 cargo tests total green.
+
 ## [2026-05-17] chore(release): bump 0.8.72 lockstep with sub node (d5a95252)
 
 Sub node 0.8.72 — Bug 23 probe timer leak fix (LoRA/CUDA/PyTorch
