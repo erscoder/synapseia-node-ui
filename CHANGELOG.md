@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.77 lockstep with sub node (fe39134)
+
+Version-only bump. No code changes. Sync with node 0.8.77 (Slice 2
+hardware probe re-run + Slice 7 npm-only version check).
+
 ## [2026-05-17] chore(release): bump 0.8.76 lockstep with sub node (565ddb36)
 
 Sub node 0.8.76 — Bug 27 Ollama pause during DiLoCo training on
