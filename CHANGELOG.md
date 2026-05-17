@@ -1,5 +1,11 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.80 lockstep with sub node (29f557f)
+
+Sync with node 0.8.80 (Slices 9+10+11: per-class slot, threshold bump
+DiLoCo 36GB / LoRA 24GB, 500ms memory sampler, Python pin_memory=False
++ low_cpu_mem_usage + gc/empty_cache).
+
 ## [2026-05-17] chore(release): bump 0.8.79 lockstep with sub node (65bc39c)
 
 Version-only. Sync with node 0.8.79 (Slice 8 LoRA preflight gate).
