@@ -1,5 +1,28 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] fix(node-ui): cfg(unix)-gate SIGTERM/SIGKILL for Windows (a9ff1a0)
+
+0.8.73 Windows CI failed with `E0425: cannot find value SIGKILL in
+crate libc` — libc on Windows does not expose Unix signal constants.
+`force_release_lock` (introduced in `cc332dc`) referenced
+`libc::SIGTERM` / `libc::SIGKILL` directly at call sites; the
+`send_signal` helper was already cfg(unix)-split but the consumers
+weren't.
+
+Fix: extracted `SIG_TERM` / `SIG_KILL` module-level constants gated by
+`cfg(unix)` (real libc constants on Unix, placeholder i32 on Windows
+that never reach a syscall because `send_signal`'s non-unix path
+short-circuits with `'Signal sending not supported'`).
+
+Operator UX on Windows: clicking "Take over" / "Stop other window"
+returns an error string when an alive PID is found. They have to kill
+via Task Manager. Acceptable v1 — iteration can use win32
+`OpenProcess` + `TerminateProcess` if Windows operator demand emerges.
+
+Mac + Linux unaffected (43 cargo tests green). 0.8.73 release exists
+with 3/4 assets (Mac arm64 + x64 DMG + Linux AppImage); next release
+will publish all 4 platforms including Windows MSI.
+
 ## [2026-05-17] chore(release): bump 0.8.73 lockstep with sub node (0f61f782)
 
 Sub node 0.8.73 — Bug 21 cgroup-aware container memory gate (DiLoCo
