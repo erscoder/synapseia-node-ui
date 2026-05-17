@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.74 lockstep with sub node (132c6922)
+
+Sub node 0.8.74 — Bug 25 fetch-work-orders cap filter regression fix.
+Bug 22 intersection (live ∩ state) was silently dropping async-added
+caps (diloco_training, lora_training, docking) gated on marker files
+and cgroup memory check. Live caps now authoritative; pods that pass
+container memory gate finally see DiLoCo/LoRA/docking WOs in their
+poll. Also bundles previously-unbumped Windows libc fix (a9ff1a0).
+
 ## [2026-05-17] fix(node-ui): cfg(unix)-gate SIGTERM/SIGKILL for Windows (a9ff1a0)
 
 0.8.73 Windows CI failed with `E0425: cannot find value SIGKILL in
