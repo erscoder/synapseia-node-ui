@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.83 lockstep with sub node
+
+Sync with node 0.8.83 (Slice 18: derive hardware mode from gpuVramGb —
+fixes DiLoCo fp32 path on NVIDIA).
+
 ## [2026-05-17] chore(release): bump 0.8.82 lockstep with sub node
 
 Sync with node 0.8.82 (Slice 17: CUDA-aware preflight threshold).
