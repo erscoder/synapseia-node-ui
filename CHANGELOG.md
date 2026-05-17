@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.78 lockstep with sub node (ee6f37d)
+
+Version-only bump. No code changes. Sync with node 0.8.78 (Slice
+1+4 DiLoCo pre-flight memory gate).
+
 ## [2026-05-17] chore(release): bump 0.8.77 lockstep with sub node (fe39134)
 
 Version-only bump. No code changes. Sync with node 0.8.77 (Slice 2
