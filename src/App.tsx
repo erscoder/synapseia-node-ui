@@ -23,6 +23,8 @@ import {
   type PythonInstallStatus,
 } from "./components/PythonDepsProgress";
 import { useUpdateChecker } from "./hooks/useUpdateChecker";
+import { useExternalLock } from "./hooks/useExternalLock";
+import { LockBanner } from "./components/LockBanner";
 
 export type Panel = "my-node" | "wallet" | "stake" | "system" | "settings" | "logs";
 
@@ -145,6 +147,17 @@ function AppInner() {
     current: number;
   }>({ open: false, limit: 0, current: 0 });
   const update = useUpdateChecker();
+  // Lock-conflict banner state. Polls ~/.synapseia/node.lock every 3 s so
+  // operators see immediate feedback when a CLI-spawned node (or a zombie
+  // lock file) is preventing Start from working. Refresh manually after
+  // any take-over / clean / start so the banner reflects reality without
+  // waiting for the next poll tick.
+  const { lock: externalLock, refresh: refreshLock } = useExternalLock(3000);
+  // Surface non-CLI-missing start_node errors so they don't fall into
+  // console.error silently — race conditions can hit start_node with a
+  // lock that appeared BETWEEN check_external_lock polls. The banner is
+  // the primary signal; this is the inline fallback.
+  const [startError, setStartError] = useState<string | null>(null);
 
   // Decide at boot whether we're creating a wallet or unlocking one.
   // Step 1 ensures the @synapseia-network/node CLI is on disk BEFORE the
@@ -345,6 +358,8 @@ function AppInner() {
   const handleStartNode = useCallback(async () => {
     if (installingRef.current) return;
     if (!password) return;
+    // Clear any prior start error so the user sees a fresh attempt.
+    setStartError(null);
     // Pre-flight capacity probe. We hit the coordinator's public
     // `/peer/capacity` endpoint BEFORE spawning the CLI; on a
     // closed-beta full house we surface the modal instantly without
@@ -386,11 +401,43 @@ function AppInner() {
         }
         return;
       }
+      // Generic non-CLI-missing errors (already-running, lock-claimed,
+      // capacity rejection from the CLI itself, etc). Surface to the UI —
+      // do NOT swallow into console.error only, that was the original bug.
       console.error("Failed to start node", e);
+      setStartError(msg);
+      // Lock state may have flipped under us; refresh the banner.
+      void refreshLock();
     } finally {
       installingRef.current = false;
     }
-  }, [password]);
+  }, [password, refreshLock]);
+
+  /**
+   * Force-release the external lock (alive case: SIGTERM + SIGKILL fallback;
+   * dead case: just delete the file) and refresh the banner.
+   * The Rust side re-verifies the lock owner before SIGKILL — see P2 fail-
+   * closed identity check in commands.rs::force_release_lock.
+   */
+  const handleTakeOver = useCallback(async () => {
+    try {
+      await invoke<void>("force_release_lock");
+      setStartError(null);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("Failed to release lock", e);
+      setStartError(msg);
+    } finally {
+      await refreshLock();
+    }
+  }, [refreshLock]);
+
+  /** Same backend path as take-over — the command handles both alive and
+   *  dead PIDs. Kept as a distinct handler so future UX changes (e.g.
+   *  different toast on success) can diverge cleanly. */
+  const handleCleanStale = useCallback(async () => {
+    await handleTakeOver();
+  }, [handleTakeOver]);
 
   const handleStopNode = useCallback(async () => {
     try {
@@ -520,6 +567,31 @@ function AppInner() {
             />
           </div>
         )}
+        {externalLock && (
+          <div className="mb-4">
+            <LockBanner
+              lock={externalLock}
+              onTakeOver={handleTakeOver}
+              onCleanStale={handleCleanStale}
+            />
+          </div>
+        )}
+        {startError && !externalLock && (
+          <div
+            role="alert"
+            className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200"
+          >
+            <p className="font-semibold">Could not start node</p>
+            <p className="mt-1 text-xs opacity-90 whitespace-pre-line">{startError}</p>
+            <button
+              type="button"
+              onClick={() => setStartError(null)}
+              className="mt-2 rounded bg-slate-700 px-3 py-1 text-xs text-slate-100 hover:bg-slate-600"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {activePanel === "my-node" && (
           <MyNodePanel
             password={password}
@@ -529,6 +601,7 @@ function AppInner() {
             onStop={handleStopNode}
             onOpenLogs={() => setActivePanel("logs")}
             onRefresh={refreshChainInfo}
+            startDisabled={!!externalLock}
           />
         )}
         {activePanel === "wallet" && (

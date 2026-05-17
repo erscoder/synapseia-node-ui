@@ -1,10 +1,11 @@
 mod commands;
 
 use commands::{
-    check_capacity, check_for_updates, create_wallet, docking_capabilities, external_node_info,
-    fetch_chain_info, get_node_logs, get_ui_settings, install_python_deps,
-    install_synapseia_node, node_status, reap_on_exit, run_command, set_ui_settings, start_node,
-    stop_node, system_info, unlock_wallet, wallet_exists, NodeProcess, NodeProcessState,
+    check_capacity, check_external_lock, check_for_updates, create_wallet, docking_capabilities,
+    external_node_info, fetch_chain_info, force_release_lock, get_node_logs, get_ui_settings,
+    install_python_deps, install_synapseia_node, node_status, reap_on_exit, run_command,
+    set_ui_settings, start_node, stop_node, system_info, unlock_wallet, wallet_exists,
+    NodeProcess, NodeProcessState,
 };
 
 use std::sync::Arc;
@@ -40,6 +41,8 @@ pub fn run() {
             unlock_wallet,
             create_wallet,
             external_node_info,
+            check_external_lock,
+            force_release_lock,
             fetch_chain_info,
             system_info,
             check_for_updates,

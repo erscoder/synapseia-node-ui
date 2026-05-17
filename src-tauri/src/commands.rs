@@ -698,24 +698,201 @@ fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // Rust std doesn't wrap kill(2) directly and we'd rather not pull in
-    // `nix` just for this. `kill -0 <pid>` does an existence + permission
-    // check without actually signalling, runs in <1ms, and is present on
-    // every Unix we ship to (macOS, Linux).
+    // Direct libc::kill(pid, 0) syscall — signal 0 is a no-op probe that
+    // returns 0 if the process exists and we have permission to signal it,
+    // -1 + ESRCH if dead, -1 + EPERM if alive but un-signalable. Runs in
+    // ~1µs vs ~10-30ms for a fork+exec to /bin/kill on macOS. Polled every
+    // 3s so the difference is measurable in steady-state CPU.
     #[cfg(unix)]
     {
-        let status = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        return matches!(status, Ok(s) if s.success());
+        // SAFETY: `kill` with signal 0 has no side effects on the target
+        // process; it only performs an existence + permission check.
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        // EPERM means the process exists but we can't signal it (different
+        // user / privileged). Treat as alive for our purposes.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return errno == libc::EPERM;
     }
     #[cfg(not(unix))]
     {
         false
     }
+}
+
+/// Detailed view of `~/.synapseia/node.lock` used by the desktop UI to render
+/// the LockBanner. Differs from `external_node_info` in two ways:
+///   - reports BOTH alive and dead (zombie) lock states so the UI can offer a
+///     "clean stale lock" path.
+///   - returns `age_seconds` so the UI can render a "running for 12m" subtext
+///     without doing date math in TypeScript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalLockInfo {
+    pub pid: u32,
+    /// "cli" | "ui" | "unknown" — sourced from the lock file. Unknown values
+    /// are surfaced verbatim so a future CLI tag (e.g. "operator") doesn't
+    /// silently collapse to "cli".
+    pub source: String,
+    /// ISO 8601 timestamp written by the lock owner.
+    pub started_at: String,
+    /// Seconds elapsed since `started_at`. Computed at read time. 0 if the
+    /// timestamp is unparseable (rare; the CLI uses `Date.toISOString()`).
+    pub age_seconds: u64,
+    /// True iff `kill(pid, 0)` returns Ok — meaning the PID is alive and
+    /// signalable. A dead PID = zombie lock that the UI can clean up.
+    pub is_alive: bool,
+}
+
+/// Read `~/.synapseia/node.lock` and report both alive and dead states. The UI
+/// polls this every 3 s to render the LockBanner. Returning `None` means
+/// "no banner" (no lock file at all). Returning `Some` with `is_alive=false`
+/// means "stale lock, offer clean action".
+///
+/// Cheap: one FS stat + one JSON parse + one `kill(pid, 0)` syscall.
+#[tauri::command]
+pub async fn check_external_lock() -> Option<ExternalLockInfo> {
+    let lock_path = synapseia_home().join("node.lock");
+    if !lock_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&lock_path).ok()?;
+    let lock: LockFile = serde_json::from_str(&content).ok()?;
+    let is_alive = is_pid_alive(lock.pid);
+    let age_seconds = parse_iso8601_age_seconds(&lock.started_at);
+    let source = if lock.source == "cli" || lock.source == "ui" {
+        lock.source
+    } else {
+        "unknown".to_string()
+    };
+    Some(ExternalLockInfo {
+        pid: lock.pid,
+        source,
+        started_at: lock.started_at,
+        age_seconds,
+        is_alive,
+    })
+}
+
+/// Compute elapsed seconds between an ISO 8601 timestamp and now. Returns 0
+/// on parse failure rather than `Option<u64>` because the UI just renders a
+/// "running for 0s" subtext in that case — strictly better than hiding the
+/// banner over a timestamp typo.
+fn parse_iso8601_age_seconds(iso: &str) -> u64 {
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(dt) => {
+            let now = chrono::Utc::now();
+            let elapsed = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
+            if elapsed.num_seconds() < 0 {
+                0
+            } else {
+                elapsed.num_seconds() as u64
+            }
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Forcefully release `~/.synapseia/node.lock`. If the lock-holding PID is
+/// alive, send SIGTERM, wait up to 5 s for graceful exit, then SIGKILL.
+/// Finally remove the lock file.
+///
+/// Safety (P2 fail-closed): we re-read the lock RIGHT BEFORE sending the
+/// signal. If the PID changed between the UI's `check_external_lock` poll and
+/// this command (race: original process exited, a new one claimed the lock),
+/// we abort with Err rather than killing the new owner.
+#[tauri::command]
+pub async fn force_release_lock() -> Result<(), String> {
+    let lock_path = synapseia_home().join("node.lock");
+    if !lock_path.exists() {
+        // Idempotent: nothing to do.
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&lock_path)
+        .map_err(|e| format!("Failed to read lock file: {}", e))?;
+    let lock: LockFile = serde_json::from_str(&content)
+        .map_err(|e| format!("Lock file is corrupt: {}", e))?;
+
+    let target_pid = lock.pid;
+
+    if is_pid_alive(target_pid) {
+        // Graceful SIGTERM first.
+        let term_err = send_signal(target_pid, libc::SIGTERM);
+        if let Err(e) = term_err {
+            return Err(format!("Failed to terminate PID {}: {}", target_pid, e));
+        }
+
+        // Poll for graceful exit every 250 ms up to 5 s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !is_pid_alive(target_pid) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        // Re-verify the lock still points at our target before escalating.
+        // If the file changed underneath us (someone else cleaned + relocked)
+        // we MUST NOT SIGKILL whatever PID is in the new file.
+        if is_pid_alive(target_pid) {
+            match std::fs::read_to_string(&lock_path) {
+                Ok(c2) => match serde_json::from_str::<LockFile>(&c2) {
+                    Ok(l2) if l2.pid == target_pid => {
+                        // Same owner still — SIGKILL it.
+                        send_signal(target_pid, libc::SIGKILL).map_err(|e| {
+                            format!("Failed to SIGKILL PID {}: {}", target_pid, e)
+                        })?;
+                    }
+                    Ok(_) => {
+                        return Err(format!(
+                            "Lock file changed during termination (PID {} no longer the owner); aborting to avoid killing an unrelated process.",
+                            target_pid
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!("Lock file became unreadable mid-release: {}", e));
+                    }
+                },
+                Err(_) => {
+                    // Lock file vanished — the process cleaned itself up.
+                    // Fall through to file removal (noop) and return Ok.
+                }
+            }
+        }
+    }
+
+    // Remove the file. Tolerate ENOENT because the dying process may have
+    // cleaned its own lock between the signal and now.
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed to remove lock file: {}", e)),
+    }
+}
+
+/// Send a Unix signal to a PID. Returns Err with the OS errno message on
+/// failure (typical: ESRCH = no such process, EPERM = not allowed).
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: libc::c_int) -> Result<(), String> {
+    // SAFETY: libc::kill is a syscall wrapper with well-defined behavior for
+    // any pid_t / signal pair. No memory is dereferenced.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        Err(err.to_string())
+    }
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _signal: i32) -> Result<(), String> {
+    Err("Signal sending not supported on this platform".to_string())
 }
 
 /// Validate a password by asking the node CLI to decrypt the wallet.
@@ -3267,5 +3444,132 @@ mod cli_freshness_tests {
     fn freshness_rejects_malformed_min() {
         let err = decide_cli_freshness("0.8.49", Some("0.8.51"), None, "not-a-version").unwrap_err();
         assert!(err.contains("MIN_NODE_CLI_VERSION"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod external_lock_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use tempfile::TempDir;
+
+    /// `SYNAPSEIA_HOME` is process-global env state — parallel tests would
+    /// stomp on each other and silently read the wrong tmpdir's lock file.
+    /// We serialize every external_lock_tests case behind a single mutex.
+    /// The guard returned from `isolate_home` keeps the lock until end of
+    /// scope (= end of test), so the next test waits.
+    fn home_lock() -> MutexGuard<'static, ()> {
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        // If a previous test panicked while holding the lock, the mutex gets
+        // poisoned. We don't care — recover the inner data and continue.
+        M.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Point SYNAPSEIA_HOME at a tmpdir for the duration of one test. The
+    /// `_guard` keeps the tmpdir alive AND keeps the env-var mutex held;
+    /// both drop at end of scope. Returns the lock path so the test can
+    /// write/inspect it.
+    fn isolate_home() -> (TempDir, PathBuf, MutexGuard<'static, ()>) {
+        let guard = home_lock();
+        let dir = TempDir::new().expect("tmpdir");
+        std::env::set_var("SYNAPSEIA_HOME", dir.path());
+        let lock = dir.path().join("node.lock");
+        (dir, lock, guard)
+    }
+
+    fn write_lock(path: &Path, pid: u32, source: &str, started_at: &str) {
+        let body = format!(
+            r#"{{"pid":{},"startedAt":"{}","source":"{}"}}"#,
+            pid, started_at, source
+        );
+        let mut f = std::fs::File::create(path).expect("create lock");
+        f.write_all(body.as_bytes()).expect("write lock");
+    }
+
+    #[tokio::test]
+    async fn check_external_lock_returns_none_when_no_file() {
+        let (_dir, lock, _mutex) = isolate_home();
+        assert!(!lock.exists());
+        let result = check_external_lock().await;
+        assert!(result.is_none(), "expected None for missing lock file");
+    }
+
+    #[tokio::test]
+    async fn check_external_lock_reports_alive_for_current_process() {
+        // Use our own PID — guaranteed alive for the duration of the test.
+        let (_dir, lock, _mutex) = isolate_home();
+        let our_pid = std::process::id();
+        let started = chrono::Utc::now().to_rfc3339();
+        write_lock(&lock, our_pid, "cli", &started);
+
+        let info = check_external_lock().await.expect("expected Some");
+        assert_eq!(info.pid, our_pid);
+        assert_eq!(info.source, "cli");
+        assert!(info.is_alive, "current process must be alive");
+        // age_seconds is small but non-negative.
+        assert!(info.age_seconds < 60, "age should be tiny");
+    }
+
+    #[tokio::test]
+    async fn check_external_lock_reports_dead_for_unused_pid() {
+        // PID 0 is reserved (kernel) on Unix; is_pid_alive short-circuits to
+        // false. This exercises the dead-PID path without spawning + reaping a
+        // real process (which is racy in CI).
+        let (_dir, lock, _mutex) = isolate_home();
+        let started = chrono::Utc::now().to_rfc3339();
+        write_lock(&lock, 0, "cli", &started);
+
+        let info = check_external_lock().await.expect("expected Some");
+        assert_eq!(info.pid, 0);
+        assert!(!info.is_alive, "PID 0 must report not-alive");
+    }
+
+    #[tokio::test]
+    async fn check_external_lock_normalises_unknown_source() {
+        let (_dir, lock, _mutex) = isolate_home();
+        let our_pid = std::process::id();
+        let started = chrono::Utc::now().to_rfc3339();
+        write_lock(&lock, our_pid, "operator-future-tag", &started);
+
+        let info = check_external_lock().await.expect("expected Some");
+        assert_eq!(info.source, "unknown");
+    }
+
+    #[tokio::test]
+    async fn force_release_lock_removes_file_when_no_process_to_kill() {
+        let (_dir, lock, _mutex) = isolate_home();
+        // PID 0 = dead, so force_release should skip the SIGTERM path entirely
+        // and just delete the file.
+        let started = chrono::Utc::now().to_rfc3339();
+        write_lock(&lock, 0, "cli", &started);
+        assert!(lock.exists());
+
+        force_release_lock().await.expect("force release should succeed");
+        assert!(!lock.exists(), "lock file should be removed");
+    }
+
+    #[tokio::test]
+    async fn force_release_lock_is_idempotent_when_no_file() {
+        let (_dir, lock, _mutex) = isolate_home();
+        assert!(!lock.exists());
+        // Calling against a missing file is a no-op success, not an error.
+        force_release_lock().await.expect("missing file is Ok");
+    }
+
+    #[test]
+    fn parse_iso8601_age_seconds_handles_valid_input() {
+        // 10 seconds ago.
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let age = parse_iso8601_age_seconds(&ts);
+        assert!(age >= 9 && age <= 12, "age was {age}");
+    }
+
+    #[test]
+    fn parse_iso8601_age_seconds_returns_zero_for_garbage() {
+        assert_eq!(parse_iso8601_age_seconds("not-a-date"), 0);
+        assert_eq!(parse_iso8601_age_seconds(""), 0);
     }
 }

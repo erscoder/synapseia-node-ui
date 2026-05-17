@@ -15,6 +15,11 @@ interface Props {
   onStop: () => void;
   onOpenLogs: () => void;
   onRefresh: () => Promise<void>;
+  /** When the external lock banner is visible, the Start button must be
+   *  disabled so the operator goes through the take-over / clean flow
+   *  before retrying. Kept as a plain boolean so the panel stays
+   *  ignorant of the lock-source semantics. */
+  startDisabled?: boolean;
 }
 
 // Aggregated reward groups for the breakdown UI. Each group sums one or more
@@ -104,6 +109,7 @@ export function MyNodePanel({
   onStop,
   onOpenLogs,
   onRefresh,
+  startDisabled = false,
 }: Props) {
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
@@ -192,9 +198,13 @@ export function MyNodePanel({
                 Stop Node
               </Button>
             ) : (
-              <Button variant="primary" onClick={onStart} disabled={!password}>
+              <Button
+                variant="primary"
+                onClick={onStart}
+                disabled={!password || startDisabled}
+              >
                 <Play className="w-4 h-4" />
-                Start Node
+                {startDisabled ? "Locked" : "Start Node"}
               </Button>
             )}
             <Button variant="secondary" onClick={onOpenLogs}>
