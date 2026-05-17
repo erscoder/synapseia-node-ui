@@ -1,5 +1,11 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-18] chore(release): bump 0.8.84 lockstep with sub node
+
+Sync with node 0.8.84 (Slice 19: TRAINING WO hardware probe — closes
+parallel cap-mismatch bug to Slice 18 for executeMicroTrainingWorkOrder
+path).
+
 ## [2026-05-17] chore(release): bump 0.8.83 lockstep with sub node
 
 Sync with node 0.8.83 (Slice 18: derive hardware mode from gpuVramGb —
