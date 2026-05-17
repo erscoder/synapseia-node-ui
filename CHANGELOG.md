@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.73 lockstep with sub node (0f61f782)
+
+Sub node 0.8.73 — Bug 21 cgroup-aware container memory gate (DiLoCo
+cap permanently stripped on containers < 40GB RAM, LoRA < 16GB; cgroup v2 + v1
+readers; defense in depth + Bug 22 local accept gate).
+
+Also bundles previously-unbumped node-ui change `cc332dc` —
+lock-conflict banner + take-over flow (see below).
+
 ## [2026-05-17] feat(node-ui): lock-conflict banner + take-over flow (cc332dc)
 
 When `~/.synapseia/node.lock` exists (CLI running, another desktop
