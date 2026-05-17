@@ -1,5 +1,9 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.79 lockstep with sub node (65bc39c)
+
+Version-only. Sync with node 0.8.79 (Slice 8 LoRA preflight gate).
+
 ## [2026-05-17] chore(release): bump 0.8.78 lockstep with sub node (ee6f37d)
 
 Version-only bump. No code changes. Sync with node 0.8.78 (Slice
