@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.65 lockstep with sub node (ed31df4e)
+
+Version bump only. See sub node 0.8.65 for runtime behavior changes (agent
+legacy WO types drop + heartbeat/install-deps/diloco hardening).
+
 ## [2026-05-17] chore(release): bump 0.8.64 lockstep with sub node (29ab3aa)
 
 Lockstep with sub node `b4d325af` — Bug 18 v2 (DiLoCo signal name +
