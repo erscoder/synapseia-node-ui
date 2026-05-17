@@ -1,5 +1,14 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.68 lockstep with sub node (e04a141)
+
+Version bump only. No node-ui-side code changes. See sub node 0.8.68
+for the runtime behavior change: macOS Vina download URL fix
+(`mac_aarch64` / `mac_x86_64` instead of `macos_arm64` / `macos_x86_64`)
+— restores docking capability after `syn install-deps` on Apple
+Silicon and Intel Macs. Boot-time `install_python_deps` Tauri command
+now actually lands Vina at `~/.synapseia/bin/vina`.
+
 ## [2026-05-17] chore(release): bump 0.8.67 lockstep with sub node (7e897d4b)
 
 Version bump only. See sub node 0.8.67 for runtime behavior change:
