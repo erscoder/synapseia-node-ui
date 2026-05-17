@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.63 lockstep with sub node (7370ad6)
+
+Lockstep with sub node `577378ad` — Bug 12 v2 (persistent lora-stack
+marker, no more cap oscillation), Bug 14 (`diloco_train.py` torch_dtype
+→ dtype for transformers 5.x), Bug 6 follow-up (plan-parse model name
+no longer logs `[object Object]`).
+
 ## [2026-05-17] chore(release): bump 0.8.62 lockstep with sub node (0f7bfb4)
 
 Lockstep with sub node `3fa1d2dc` — Bug 12 fix: `isLoraStackAvailable()`
