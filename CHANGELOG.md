@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.81 lockstep with sub node
+
+Sync with node 0.8.81 (Slice 16: NVIDIA detection + torch+cu121 wheel —
+fixes DiLoCo fp32 OOM root cause on NVIDIA pods).
+
 ## [2026-05-17] chore(release): bump 0.8.80 lockstep with sub node (29f557f)
 
 Sync with node 0.8.80 (Slices 9+10+11: per-class slot, threshold bump
