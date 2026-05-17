@@ -1,5 +1,11 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.62 lockstep with sub node (0f7bfb4)
+
+Lockstep with sub node `3fa1d2dc` — Bug 12 fix: `isLoraStackAvailable()`
+now captures stderr + reports verbatim, drops memory-gated warn so
+operator can diagnose why pods don't advertise `lora_training` cap.
+
 ## [2026-05-16] chore(release): bump 0.8.61 lockstep with sub node (5233a8d)
 
 Lockstep with sub node `ea7e5684` (docking apt/dnf lock retry + 3-attempt
