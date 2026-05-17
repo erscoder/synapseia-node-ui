@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.70 lockstep with sub node (ab41b225)
+
+Version bump only. Sub node 0.8.70 Bug 18 v3 — DiLoCo runtime now
+local-only (`local_files_only=True`); operator no longer needs
+HF_TOKEN to run DiLoCo training. Model is pre-downloaded at
+install-deps; runtime never touches HF Hub.
+
 ## [2026-05-17] chore(release): bump 0.8.69 lockstep with sub node (ed4349b6)
 
 Version bump only. Sub node 0.8.69 Bug 22 cap-aware local accept gate
