@@ -694,6 +694,19 @@ fn read_external_lock(our_pid: Option<u32>) -> Option<ExternalNodeInfo> {
     })
 }
 
+// Signal constants — gated by cfg(unix) because libc on Windows does not
+// expose SIGTERM/SIGKILL (Windows uses different process termination APIs).
+// The cfg(not(unix)) placeholders preserve the call-site signature so the
+// code compiles cross-platform; send_signal on Windows always returns Err.
+#[cfg(unix)]
+const SIG_TERM: libc::c_int = libc::SIGTERM;
+#[cfg(not(unix))]
+const SIG_TERM: i32 = 15;
+#[cfg(unix)]
+const SIG_KILL: libc::c_int = libc::SIGKILL;
+#[cfg(not(unix))]
+const SIG_KILL: i32 = 9;
+
 fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -819,7 +832,7 @@ pub async fn force_release_lock() -> Result<(), String> {
 
     if is_pid_alive(target_pid) {
         // Graceful SIGTERM first.
-        let term_err = send_signal(target_pid, libc::SIGTERM);
+        let term_err = send_signal(target_pid, SIG_TERM);
         if let Err(e) = term_err {
             return Err(format!("Failed to terminate PID {}: {}", target_pid, e));
         }
@@ -844,7 +857,7 @@ pub async fn force_release_lock() -> Result<(), String> {
                 Ok(c2) => match serde_json::from_str::<LockFile>(&c2) {
                     Ok(l2) if l2.pid == target_pid => {
                         // Same owner still — SIGKILL it.
-                        send_signal(target_pid, libc::SIGKILL).map_err(|e| {
+                        send_signal(target_pid, SIG_KILL).map_err(|e| {
                             format!("Failed to SIGKILL PID {}: {}", target_pid, e)
                         })?;
                     }
