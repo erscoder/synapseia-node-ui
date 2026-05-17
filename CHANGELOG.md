@@ -1,5 +1,9 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.82 lockstep with sub node
+
+Sync with node 0.8.82 (Slice 17: CUDA-aware preflight threshold).
+
 ## [2026-05-17] chore(release): bump 0.8.81 lockstep with sub node
 
 Sync with node 0.8.81 (Slice 16: NVIDIA detection + torch+cu121 wheel —
