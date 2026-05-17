@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.76 lockstep with sub node (565ddb36)
+
+Sub node 0.8.76 — Bug 27 Ollama pause during DiLoCo training on
+containers <80GB. Pods 40-80GB now train DiLoCo without OOM.
+
 ## [2026-05-17] chore(release): bump 0.8.75 lockstep with sub node (df860d84)
 
 Sub node 0.8.75 — Bug 26 MOLECULAR_DOCKING cap name typo fix
