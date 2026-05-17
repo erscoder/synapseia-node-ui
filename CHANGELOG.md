@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.64 lockstep with sub node (29ab3aa)
+
+Lockstep with sub node `b4d325af` — Bug 18 v2 (DiLoCo signal name +
+HF_TOKEN passthrough + retry around HF Hub from_pretrained).
+
 ## [2026-05-17] chore(release): bump 0.8.63 lockstep with sub node (7370ad6)
 
 Lockstep with sub node `577378ad` — Bug 12 v2 (persistent lora-stack
