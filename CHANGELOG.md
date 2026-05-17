@@ -1,5 +1,15 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.66 lockstep with sub node (735458c)
+
+Version bump only. No node-ui-side code changes. See sub node 0.8.66 for
+runtime behavior changes:
+- `claim_rewards` instruction now sends 8 accounts (was 7) — fixes the
+  `AccountDiscriminatorMismatch` (3002 / 0xbba) error that blocked
+  vault claim from the node-ui Vault Claim button.
+- LORA + DiLoCo memory floors bumped (8192 / 14336) so under-resourced
+  Mac M-series nodes stop auto-classifying as capable for those caps.
+
 ## [2026-05-17] chore(release): bump 0.8.65 lockstep with sub node (ed31df4e)
 
 Version bump only. See sub node 0.8.65 for runtime behavior changes (agent
