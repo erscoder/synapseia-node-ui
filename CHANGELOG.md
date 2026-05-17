@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.69 lockstep with sub node (ed4349b6)
+
+Version bump only. Sub node 0.8.69 Bug 22 cap-aware local accept gate
+— prevents node from accepting WO type not in its current advertised
+caps (was OOM-ing Mac M-series when accepting DiLoCo despite
+diloco_training cap being stripped by memory floor).
+
 ## [2026-05-17] chore(release): bump 0.8.68 lockstep with sub node (e04a141)
 
 Version bump only. No node-ui-side code changes. See sub node 0.8.68
