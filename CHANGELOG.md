@@ -1,5 +1,11 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.72 lockstep with sub node (d5a95252)
+
+Sub node 0.8.72 — Bug 23 probe timer leak fix (LoRA/CUDA/PyTorch
+heartbeat probes now `clearTimeout` in success path, no more
+30-60s graceful shutdown delay).
+
 ## [2026-05-17] chore(release): bump 0.8.71 lockstep with sub node (99eedff3)
 
 Sub node 0.8.71 — Bug 20 obabel timeout 180s → 600s + env override
