@@ -1,5 +1,12 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.67 lockstep with sub node (7e897d4b)
+
+Version bump only. See sub node 0.8.67 for runtime behavior change:
+Bug 12 v3 caps-oscillation fix — heartbeat now hysteresis+cooldown
+gates LoRA/DiLoCo caps so they stop flipping every minute on nodes
+where free memory jitters around the floor.
+
 ## [2026-05-17] chore(release): bump 0.8.66 lockstep with sub node (735458c)
 
 Version bump only. No node-ui-side code changes. See sub node 0.8.66 for
