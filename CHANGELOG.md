@@ -1,5 +1,11 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-17] chore(release): bump 0.8.71 lockstep with sub node (99eedff3)
+
+Sub node 0.8.71 — Bug 20 obabel timeout 180s → 600s + env override
+(`DOCKING_OBABEL_TIMEOUT_MS`) for complex drug ligands like Indinavir/
+Imatinib that legitimately take 5-10min for 3D coordinate generation.
+
 ## [2026-05-17] chore(release): bump 0.8.70 lockstep with sub node (ab41b225)
 
 Version bump only. Sub node 0.8.70 Bug 18 v3 — DiLoCo runtime now
