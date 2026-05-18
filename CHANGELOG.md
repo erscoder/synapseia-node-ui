@@ -1,5 +1,17 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-18] chore(release): bump 0.8.86 lockstep with sub node (be360e0)
+
+Sync with node 0.8.86 (Bug 28 Slice 18 v3 — DiLoCo training inner
+loop OOM mitigations on 24 GB pods: `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True`, default `batch_size` 4 to 1 with P31
+clamp, `gradient_checkpointing_enable(use_reentrant=False)` plus
+`enable_input_require_grads()` after `get_peft_model`, plus
+`use_cache=False` to keep HF from silently disabling checkpointing).
+
+No source changes in node-ui. Version bump only to satisfy the
+node + node-ui lockstep sync rule.
+
 ## [2026-05-18] chore(release): bump 0.8.85 lockstep with sub node
 
 Sync with node 0.8.85:
