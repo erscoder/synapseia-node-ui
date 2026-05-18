@@ -1,5 +1,13 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-18] chore(release): bump 0.8.85 lockstep with sub node
+
+Sync with node 0.8.85:
+- Slice 18 v2 — DiLoCo CUDA load OOM 3-mitigation fix
+  (bnb_4bit_quant_storage=uint8, device_map={"":0}, hard VRAM<12GB gate).
+- Bug 20 v2 — obabel --gen3d two-tier retry (med 300s → fast 300s) so
+  drug-like ligands finish within 600s wall budget.
+
 ## [2026-05-18] chore(release): bump 0.8.84 lockstep with sub node
 
 Sync with node 0.8.84 (Slice 19: TRAINING WO hardware probe — closes
