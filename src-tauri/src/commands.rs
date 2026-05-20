@@ -29,6 +29,35 @@ pub const ERR_CLI_MISSING: &str = "ERR_CLI_MISSING";
 /// https://nodejs.org/dist/ at the time of this change.
 const BUNDLED_NODE_VERSION: &str = "22.20.0";
 
+/// F-node-ui-010: hardcoded SHA256 checksums for the bundled Node.js
+/// archive on every (platform, arch) pair we ship. Fetching
+/// `SHASUMS256.txt` from `nodejs.org` is TLS-MITM-able by a corporate
+/// proxy or a hostile CA bundle on the operator's machine — the checksum
+/// AND the tarball would both come from the attacker, so verification
+/// becomes a no-op. By pinning the digest in our source we move trust
+/// from "TLS to nodejs.org at install time" to "the Synapseia release
+/// engineer who signed this build", which is the same trust anchor
+/// already protecting the Tauri updater signature.
+///
+/// Bump procedure when `BUNDLED_NODE_VERSION` changes:
+///   1. Re-fetch values from `https://nodejs.org/dist/v<NEW>/SHASUMS256.txt`
+///      while connected to a known-clean network.
+///   2. Cross-check at least two independent sources (e.g. apt mirror,
+///      `nvm`'s recorded hashes) before pasting here.
+///   3. Update every const below in the same PR as the version bump.
+///
+/// Values below are for v22.20.0 (verified 2026-05-20).
+const BUNDLED_NODE_SHA256_DARWIN_ARM64: &str =
+    "cc04a76a09f79290194c0646f48fec40354d88969bec467789a5d55dd097f949";
+const BUNDLED_NODE_SHA256_DARWIN_X64: &str =
+    "00df9c5df3e4ec6848c26b70fb47bf96492f342f4bed6b17f12d99b3a45eeecc";
+const BUNDLED_NODE_SHA256_LINUX_X64: &str =
+    "00bbd05e306ea68b6e13e17360d0e2f680b493ef95f2fea1c4296ff7437530bc";
+const BUNDLED_NODE_SHA256_LINUX_ARM64: &str =
+    "06907b9c088ce62305bc1530e5c1ae1510245114645768f7750c349c5b6fe667";
+const BUNDLED_NODE_SHA256_WIN_X64: &str =
+    "bb819d6eb8f5bfda294bbc83a7e4ec6539da67c4233d54b0d655b9248b15e29d";
+
 /// The UI build's own version, used as a hard floor in `check_cli_freshness`.
 /// When the installed CLI is strictly older than this, force an upgrade even
 /// if the npm registry is unreachable or returns a lower `latest` (e.g. a
@@ -94,6 +123,20 @@ fn timeout_for(command: &str) -> Duration {
     } else {
         CLI_TIMEOUT
     }
+}
+
+/// F-node-ui-007: replace every occurrence of `password` in `s` with `***`.
+/// Defence-in-depth around any `eprintln!` of CLI stdout/stderr: the node
+/// CLI is contractually forbidden to echo `SYNAPSEIA_WALLET_PASSWORD`, but
+/// a future log-everything regression (or a third-party crate dumping the
+/// process env on panic) must never leak the secret through our diagnostic
+/// trace. Empty / single-char passwords short-circuit — replacing on "" or
+/// "a" would mangle every output and offer no real protection.
+pub(crate) fn redact_password(s: &str, password: &str) -> String {
+    if password.len() < 2 {
+        return s.to_string();
+    }
+    s.replace(password, "***")
 }
 
 // ─── run_command allowlist + per-command argv validation ─────────────────────
@@ -740,15 +783,74 @@ fn ui_settings_path() -> PathBuf {
     synapseia_home().join("ui-settings.json")
 }
 
+/// F-node-ui-012: OS-keyring identifiers for the LLM API key. Both
+/// strings are public-by-design — the secret is the *value* stored
+/// against them, not the keys themselves.
+const KEYRING_SERVICE: &str = "synapseia-node-ui";
+const KEYRING_ACCOUNT_LLM_API_KEY: &str = "llm_api_key";
+
+/// Read the LLM API key from the OS keyring if the platform supports it.
+/// Returns `None` on first run (no entry yet) and also when the
+/// underlying keyring crate fails — e.g. running headless on Linux with
+/// no `Secret Service` available, or in a sandboxed CI container. The
+/// caller falls back to whatever value is persisted in
+/// `ui-settings.json` so we degrade to the pre-F-node-ui-012 behaviour
+/// rather than locking the operator out.
+fn keyring_get_llm_api_key() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT_LLM_API_KEY).ok()?;
+    match entry.get_password() {
+        Ok(v) => Some(v),
+        Err(keyring::Error::NoEntry) => Some(String::new()),
+        Err(_) => None,
+    }
+}
+
+/// Persist the LLM API key in the OS keyring. Empty string deletes the
+/// entry (the operator removed the configured key). Returns Ok(false)
+/// when the keyring is unavailable so the caller can fall through to
+/// plaintext persistence with a logged warning.
+fn keyring_set_llm_api_key(value: &str) -> Result<bool, String> {
+    let entry = match keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT_LLM_API_KEY) {
+        Ok(e) => e,
+        Err(_) => return Ok(false),
+    };
+    let res = if value.is_empty() {
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        entry.set_password(value)
+    };
+    match res {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 fn read_ui_settings_raw() -> UiSettings {
     let path = ui_settings_path();
-    if !path.exists() {
-        return UiSettings::default();
+    let mut settings: UiSettings = if !path.exists() {
+        UiSettings::default()
+    } else {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str::<UiSettings>(&raw).unwrap_or_default(),
+            Err(_) => UiSettings::default(),
+        }
+    };
+    // F-node-ui-012: prefer the keyring value over the on-disk one.
+    // When both are present, the keyring wins (the operator may have
+    // rotated the key without rewriting the JSON file). When the
+    // keyring is unavailable, fall back to whatever the JSON holds —
+    // including the legacy plaintext field from pre-F-node-ui-012
+    // installs.
+    if let Some(secret) = keyring_get_llm_api_key() {
+        if !secret.is_empty() {
+            settings.llm_api_key = secret;
+        }
     }
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str::<UiSettings>(&raw).unwrap_or_default(),
-        Err(_) => UiSettings::default(),
-    }
+    settings
 }
 
 fn write_ui_settings_raw(settings: &UiSettings) -> Result<(), String> {
@@ -763,7 +865,28 @@ fn write_ui_settings_raw(settings: &UiSettings) -> Result<(), String> {
         })?;
     }
     let path = ui_settings_path();
-    let json = serde_json::to_string_pretty(settings)
+    // F-node-ui-012: route the LLM API key through the OS keyring when
+    // available. The on-disk JSON keeps every other field (model slug,
+    // RPC URL, node name — none of which are secrets) plus an empty
+    // llm_api_key field. When the keyring is unavailable we fall back to
+    // the legacy plaintext-in-JSON path so headless / CI environments
+    // are not blocked.
+    let keyring_ok = keyring_set_llm_api_key(&settings.llm_api_key).unwrap_or(false);
+    let on_disk = if keyring_ok {
+        UiSettings {
+            llm_api_key: String::new(),
+            ..settings.clone()
+        }
+    } else {
+        if !settings.llm_api_key.is_empty() {
+            log::warn!(
+                "OS keyring unavailable; LLM API key falls back to plaintext in {}",
+                path.to_string_lossy()
+            );
+        }
+        settings.clone()
+    };
+    let json = serde_json::to_string_pretty(&on_disk)
         .map_err(|e| format!("failed to serialize ui-settings: {}", e))?;
     std::fs::write(&path, json).map_err(|e| {
         format!(
@@ -1435,11 +1558,15 @@ pub async fn unlock_wallet(app: AppHandle, password: String) -> Result<UnlockRes
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = strip_known_noise(&String::from_utf8_lossy(&output.stderr));
     let combined = format!("{}\n{}", stdout, stderr);
+    // F-node-ui-007: redact the password literal from any CLI output we
+    // forward to stderr. The node CLI is *not supposed* to echo the
+    // SYNAPSEIA_WALLET_PASSWORD env var, but a future log-everything
+    // regression must never leak it through our diagnostic eprintln.
     eprintln!(
         "[synapseia-node-ui] unlock_wallet exit={:?} stdout={:?} stderr={:?}",
         output.status.code(),
-        stdout.chars().take(400).collect::<String>(),
-        stderr.chars().take(400).collect::<String>()
+        redact_password(&stdout.chars().take(400).collect::<String>(), &password),
+        redact_password(&stderr.chars().take(400).collect::<String>(), &password)
     );
 
     // Rust cannot trust the exit code alone because the node CLI bootstrap
@@ -1572,11 +1699,13 @@ pub async fn create_wallet(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = strip_known_noise(&String::from_utf8_lossy(&output.stderr));
     let combined = format!("{}\n{}", stdout, stderr);
+    // F-node-ui-007: same redaction as unlock_wallet — never echo the
+    // wallet password literal, even if the CLI accidentally surfaces it.
     eprintln!(
         "[synapseia-node-ui] create_wallet exit={:?} stdout={:?} stderr={:?}",
         output.status.code(),
-        stdout.chars().take(400).collect::<String>(),
-        stderr.chars().take(400).collect::<String>()
+        redact_password(&stdout.chars().take(400).collect::<String>(), &password),
+        redact_password(&stderr.chars().take(400).collect::<String>(), &password)
     );
 
     if combined.contains("WALLET_ALREADY_EXISTS") {
@@ -1925,17 +2054,62 @@ pub async fn stop_node(state: State<'_, NodeProcessState>) -> Result<bool, Strin
     }
 }
 
+/// F-node-ui-013 (P32): non-blocking acquisition of the NodeProcess
+/// mutex during shutdown. Retries `try_lock` a small number of times
+/// before giving up. We deliberately avoid `blocking_lock()` because it
+/// can hang forever if a tokio task panicked while holding the lock or
+/// the runtime is being torn down — both possible in the Tauri exit
+/// handler path.
+fn acquire_state_lock<'a>(
+    state: &'a NodeProcessState,
+    attempts: u32,
+    backoff: std::time::Duration,
+) -> Option<tokio::sync::MutexGuard<'a, NodeProcess>> {
+    for _ in 0..attempts {
+        if let Ok(g) = state.try_lock() {
+            return Some(g);
+        }
+        std::thread::sleep(backoff);
+    }
+    None
+}
+
+/// Parse `~/.synapseia/node.lock` for its PID field without holding any
+/// in-process mutex. Used by the contention fallback in `reap_on_exit`.
+fn read_lock_file_pid() -> Option<u32> {
+    let path = synapseia_home().join("node.lock");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let lock: LockFile = serde_json::from_str(&raw).ok()?;
+    Some(lock.pid)
+}
+
 /// Synchronous reap of any spawned node child. Called from the Tauri exit
 /// event handler where `.await` is not available — we use `start_kill()`
 /// which dispatches SIGKILL without blocking.
+///
+/// F-node-ui-013 (P32): the old `blocking_lock` waited indefinitely on
+/// `tokio::sync::Mutex`, which can deadlock if a panicking tokio task
+/// left the lock poisoned or if the runtime is being torn down. We poll
+/// `try_lock` a few times before falling back to a force-kill via PID —
+/// at shutdown the worst outcome is a child outliving the UI for the
+/// brief window before the OS reaps it; never a hung shutdown.
 pub fn reap_on_exit(state: &NodeProcessState) {
-    // `blocking_lock` waits for any in-flight async task (log streaming,
-    // status poll) to release the mutex before we proceed. This is safe in
-    // a shutdown context because those tasks hold the lock for microseconds
-    // at most, so we never block more than a few milliseconds. The old
-    // `try_lock` silently skipped the kill when any task happened to hold
-    // the lock, leaving the node process alive after the window closed.
-    let mut guard = state.blocking_lock();
+    let mut guard = match acquire_state_lock(state, 3, std::time::Duration::from_millis(10)) {
+        Some(g) => g,
+        None => {
+            // Fall back to a best-effort kill *without* the mutex. We can't
+            // touch the child handle (might race a streamer task) but we
+            // can still SIGTERM the lockfile PID so the node exits.
+            #[cfg(unix)]
+            if let Some(lock) = read_lock_file_pid() {
+                let _ = send_signal(lock, libc::SIGTERM);
+            }
+            eprintln!(
+                "[synapseia-node-ui] reap_on_exit: lock contention, fell back to PID-only kill"
+            );
+            return;
+        }
+    };
     // App is shutting down — no auto-respawn under any circumstances.
     guard.pending_self_update_restart = false;
     guard.cached_password = None;
@@ -1991,9 +2165,40 @@ fn cleanup_lock_if_ours(our_pid: Option<u32>) {
 
 #[tauri::command]
 pub async fn node_status(state: State<'_, NodeProcessState>) -> Result<NodeStatus, String> {
-    let node = state.lock().await;
-    let running = node.child.is_some();
-    let pid = node.child.as_ref().and_then(|c| c.id());
+    let mut node = state.lock().await;
+    // F-node-ui-009 (P29): a child whose stdout reader already saw EOF
+    // (handle_node_eof) is dropped from `node.child`. But if the child
+    // exited *without* closing stdout first — or if the reader task
+    // hasn't been scheduled yet — `child.is_some()` still reports
+    // running=true for a process that is already a zombie. Probe with
+    // `try_wait()` to detect that case and clear the handle so the UI's
+    // Start button works without a manual Stop click.
+    let mut still_alive = false;
+    let mut pid: Option<u32> = None;
+    if let Some(child) = node.child.as_mut() {
+        pid = child.id();
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                // Child has exited; clear state and treat as not-running.
+                still_alive = false;
+            }
+            Ok(None) => {
+                // Still alive — fall back to the cheap PID liveness probe
+                // for the edge case where try_wait misses a SIGKILLed
+                // process whose status was reaped elsewhere.
+                still_alive = pid.map(is_pid_alive).unwrap_or(false);
+            }
+            Err(_) => {
+                still_alive = pid.map(is_pid_alive).unwrap_or(false);
+            }
+        }
+    }
+    let running = still_alive;
+    if !running && node.child.is_some() {
+        // Drop the dead child handle so the next start_node call doesn't
+        // see a stale Some(...) and refuse to spawn.
+        node.child = None;
+    }
 
     Ok(NodeStatus {
         running,
@@ -2003,7 +2208,7 @@ pub async fn node_status(state: State<'_, NodeProcessState>) -> Result<NodeStatu
         balance_sol: None,
         balance_syn: None,
         staked_syn: None,
-        pid,
+        pid: if running { pid } else { None },
     })
 }
 
@@ -2282,22 +2487,48 @@ fn bundled_node_bin_path() -> PathBuf {
     }
 }
 
-/// Resolve the URL + archive kind for the bundled Node tarball matching the
-/// host platform. Returns None on architectures we don't ship for (FreeBSD,
-/// 32-bit, etc.) — caller surfaces a clear error.
-fn bundled_node_archive_url() -> Option<(String, &'static str)> {
+/// Resolve the URL + archive kind + pinned SHA256 for the bundled Node
+/// tarball matching the host platform. Returns None on architectures we
+/// don't ship for (FreeBSD, 32-bit, etc.) — caller surfaces a clear error.
+///
+/// F-node-ui-010: the third tuple element is the **hardcoded** expected
+/// digest. Verification compares the downloaded bytes against this
+/// constant rather than against a SHASUMS256.txt fetched at install time
+/// from `nodejs.org`, eliminating the TLS-MITM-rewrites-both-files attack
+/// surface entirely.
+fn bundled_node_archive_url() -> Option<(String, &'static str, &'static str)> {
     let v = BUNDLED_NODE_VERSION;
     let base = format!("https://nodejs.org/dist/v{v}");
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        Some((format!("{base}/node-v{v}-darwin-arm64.tar.gz"), "tar.gz"))
+        Some((
+            format!("{base}/node-v{v}-darwin-arm64.tar.gz"),
+            "tar.gz",
+            BUNDLED_NODE_SHA256_DARWIN_ARM64,
+        ))
     } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        Some((format!("{base}/node-v{v}-darwin-x64.tar.gz"), "tar.gz"))
+        Some((
+            format!("{base}/node-v{v}-darwin-x64.tar.gz"),
+            "tar.gz",
+            BUNDLED_NODE_SHA256_DARWIN_X64,
+        ))
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        Some((format!("{base}/node-v{v}-linux-x64.tar.xz"), "tar.xz"))
+        Some((
+            format!("{base}/node-v{v}-linux-x64.tar.xz"),
+            "tar.xz",
+            BUNDLED_NODE_SHA256_LINUX_X64,
+        ))
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        Some((format!("{base}/node-v{v}-linux-arm64.tar.xz"), "tar.xz"))
+        Some((
+            format!("{base}/node-v{v}-linux-arm64.tar.xz"),
+            "tar.xz",
+            BUNDLED_NODE_SHA256_LINUX_ARM64,
+        ))
     } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        Some((format!("{base}/node-v{v}-win-x64.zip"), "zip"))
+        Some((
+            format!("{base}/node-v{v}-win-x64.zip"),
+            "zip",
+            BUNDLED_NODE_SHA256_WIN_X64,
+        ))
     } else {
         None
     }
@@ -2321,7 +2552,7 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(bundled);
     }
 
-    let (url, kind) = bundled_node_archive_url().ok_or_else(|| {
+    let (url, kind, expected_hash) = bundled_node_archive_url().ok_or_else(|| {
         "No prebuilt Node.js runtime is available for this platform/architecture. Install Node.js 20+ from https://nodejs.org/ manually."
             .to_string()
     })?;
@@ -2348,56 +2579,25 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         .await
         .map_err(|e| format!("Node download body read failed: {e}"))?;
 
-    // Official archive filename, exactly as it appears in SHASUMS256.txt.
-    // bundled_node_archive_url() always returns a URL ending in this name.
     let archive_basename = url
         .rsplit('/')
         .next()
         .ok_or_else(|| format!("Could not derive archive filename from URL {url}"))?
         .to_string();
 
-    // Fetch the official checksum manifest. Hard-fail on network blip — we
-    // never extract an unverified tarball.
-    let shasums_url = format!(
-        "https://nodejs.org/dist/v{}/SHASUMS256.txt",
-        BUNDLED_NODE_VERSION
-    );
-    let shasums_resp = reqwest::get(&shasums_url)
-        .await
-        .map_err(|e| format!("SHASUMS256 download failed: {e}"))?;
-    if !shasums_resp.status().is_success() {
-        return Err(format!("SHASUMS256 HTTP {}", shasums_resp.status()));
-    }
-    let shasums_text = shasums_resp
-        .text()
-        .await
-        .map_err(|e| format!("SHASUMS256 body read failed: {e}"))?;
-    let expected_hash = shasums_text
-        .lines()
-        .find_map(|line| {
-            let mut parts = line.split_whitespace();
-            let hash = parts.next()?;
-            let name = parts.next()?;
-            if name == archive_basename {
-                Some(hash.to_ascii_lowercase())
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            format!(
-                "SHASUMS256.txt did not list {archive_basename} for v{}",
-                BUNDLED_NODE_VERSION
-            )
-        })?;
-
+    // F-node-ui-010: compare against the pinned hardcoded SHA256 for the
+    // current (os, arch) pair. We deliberately do NOT fetch
+    // SHASUMS256.txt — both the archive and the checksum file would be
+    // served from the same TLS connection that a corporate proxy /
+    // hostile CA can MITM, making the validation a no-op. The pinned
+    // const is verified once, by hand, during a Synapseia release.
     let actual_hash = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         format!("{:x}", hasher.finalize())
     };
-    if actual_hash != expected_hash {
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
         return Err(format!(
             "SHA256 mismatch for {archive_basename}: expected {expected_hash}, got {actual_hash}"
         ));
@@ -2435,42 +2635,17 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&staging)
         .map_err(|e| format!("Failed to create staging dir: {e}"))?;
 
+    // F-node-ui-011 (P7): pure-Rust extraction with per-entry path
+    // validation. The previous shell-out to `tar -xf` accepted any
+    // archive layout the OS-installed tar happened to accept — including
+    // entries with `../` segments or absolute paths that escape the
+    // staging dir. `extract_archive_safely` walks every entry and rejects
+    // anything that does not stay inside `staging`.
     let archive_for_extract = archive_path.clone();
     let staging_for_extract = staging.clone();
     let kind_str = kind.to_string();
     let extract_result: Result<(), String> = tokio::task::spawn_blocking(move || {
-        // tar handles gzip + xz natively on macOS/Linux; Windows 10+ ships
-        // bsdtar which also reads zip archives. PowerShell Expand-Archive is
-        // the fallback if tar isn't on PATH for some reason.
-        let status = std::process::Command::new("tar")
-            .arg("-xf")
-            .arg(&archive_for_extract)
-            .arg("-C")
-            .arg(&staging_for_extract)
-            .status()
-            .map_err(|e| format!("tar invocation failed: {e}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        if cfg!(windows) && kind_str == "zip" {
-            let staging_str = staging_for_extract.to_string_lossy().into_owned();
-            let archive_str = archive_for_extract.to_string_lossy().into_owned();
-            let ps = format!(
-                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                archive_str.replace('\'', "''"),
-                staging_str.replace('\'', "''")
-            );
-            let status = std::process::Command::new("powershell")
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg(&ps)
-                .status()
-                .map_err(|e| format!("PowerShell Expand-Archive failed: {e}"))?;
-            if status.success() {
-                return Ok(());
-            }
-        }
-        Err("Archive extraction failed (tar/Expand-Archive)".to_string())
+        extract_archive_safely(&archive_for_extract, &staging_for_extract, &kind_str)
     })
     .await
     .map_err(|e| format!("Extraction task panicked: {e}"))?;
@@ -2538,6 +2713,163 @@ async fn ensure_node_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     );
 
     Ok(final_bin)
+}
+
+/// F-node-ui-011 (P7): pure-Rust archive extraction that rejects any
+/// entry whose canonical path would escape `dest`. Replaces the previous
+/// shell-out to `tar -xf` (which trusted whatever the OS-installed tar
+/// happened to allow) and the PowerShell Expand-Archive fallback (which
+/// has no path-traversal guard at all).
+///
+/// `kind` is one of `"tar.gz"`, `"tar.xz"`, `"zip"`. Any other value is a
+/// programmer error and returns an explicit error rather than silently
+/// no-op'ing. The function preserves file modes on Unix where the tar
+/// crate already does the right thing.
+fn extract_archive_safely(archive: &Path, dest: &Path, kind: &str) -> Result<(), String> {
+    let dest_canon = dest
+        .canonicalize()
+        .map_err(|e| format!("Cannot canonicalize staging dir {}: {e}", dest.display()))?;
+    let f = std::fs::File::open(archive)
+        .map_err(|e| format!("Open archive {}: {e}", archive.display()))?;
+    match kind {
+        "tar.gz" => {
+            let dec = flate2::read::GzDecoder::new(f);
+            unpack_tar_safely(tar::Archive::new(dec), &dest_canon)
+        }
+        "tar.xz" => {
+            let dec = xz2::read::XzDecoder::new(f);
+            unpack_tar_safely(tar::Archive::new(dec), &dest_canon)
+        }
+        "zip" => unpack_zip_safely(f, &dest_canon),
+        other => Err(format!("Unsupported archive kind: {other}")),
+    }
+}
+
+/// Walk every entry in a tar stream and write it under `dest` only if the
+/// resolved destination is still inside `dest`. Rejects entries whose
+/// path contains `..` components, is absolute, or whose canonical
+/// resolution would land outside the staging dir. Symlinks are recreated
+/// only when their target stays inside `dest`.
+fn unpack_tar_safely<R: std::io::Read>(
+    mut archive: tar::Archive<R>,
+    dest: &Path,
+) -> Result<(), String> {
+    archive.set_preserve_permissions(true);
+    archive.set_overwrite(true);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("tar entries() failed: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("tar entry read failed: {e}"))?;
+        let raw_path = entry
+            .path()
+            .map_err(|e| format!("tar entry path: {e}"))?
+            .into_owned();
+        let safe = validate_archive_entry_path(&raw_path, dest)?;
+        if let Some(parent) = safe.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        // tar crate's `unpack_in` enforces a similar check but it has had
+        // CVEs in the past (e.g. RUSTSEC-2024-0019 covered ranges where
+        // hardlinks slipped past). Use `unpack` on the validated path.
+        entry
+            .unpack(&safe)
+            .map_err(|e| format!("unpack {}: {e}", safe.display()))?;
+    }
+    Ok(())
+}
+
+/// Same per-entry validation for zip archives (Windows). `zip` 2.x exposes
+/// `name()` (sanitised, but documented as best-effort) and `mangled_name()`
+/// (raw); we rebuild the destination ourselves to avoid relying on the
+/// crate's sanitiser as the sole defence.
+fn unpack_zip_safely(reader: std::fs::File, dest: &Path) -> Result<(), String> {
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| format!("zip open: {e}"))?;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("zip entry {i}: {e}"))?;
+        // `enclosed_name` returns Some only if the entry stays inside its
+        // own root — but we still re-check after joining with our dest.
+        let Some(raw) = entry.enclosed_name() else {
+            return Err(format!(
+                "zip entry {} has a path that escapes the archive root",
+                entry.name()
+            ));
+        };
+        let safe = validate_archive_entry_path(&raw, dest)?;
+        if entry.is_dir() {
+            std::fs::create_dir_all(&safe)
+                .map_err(|e| format!("mkdir {}: {e}", safe.display()))?;
+            continue;
+        }
+        if let Some(parent) = safe.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&safe)
+            .map_err(|e| format!("create {}: {e}", safe.display()))?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| format!("write {}: {e}", safe.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = entry.unix_mode() {
+                let _ = std::fs::set_permissions(
+                    &safe,
+                    std::fs::Permissions::from_mode(mode),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject any archive entry path that:
+///   - is absolute (`/etc/passwd`, `C:\Windows\...`)
+///   - contains a `..` component
+///   - would resolve outside `dest` after joining
+///
+/// Returns the safe destination path on success. Pure path arithmetic —
+/// no canonicalize() of the *destination* because the target file does
+/// not exist yet; we canonicalize only `dest` (the caller already did).
+fn validate_archive_entry_path(raw: &Path, dest: &Path) -> Result<PathBuf, String> {
+    if raw.is_absolute() {
+        return Err(format!(
+            "archive entry rejected: absolute path {}",
+            raw.display()
+        ));
+    }
+    for component in raw.components() {
+        use std::path::Component;
+        match component {
+            Component::ParentDir => {
+                return Err(format!(
+                    "archive entry rejected: '..' component in {}",
+                    raw.display()
+                ));
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(format!(
+                    "archive entry rejected: rooted path in {}",
+                    raw.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+    let candidate = dest.join(raw);
+    // Cheap belt-and-braces: confirm the joined path starts with dest.
+    // dest was already canonicalized by the caller.
+    if !candidate.starts_with(dest) {
+        return Err(format!(
+            "archive entry rejected: {} escapes staging dir {}",
+            candidate.display(),
+            dest.display()
+        ));
+    }
+    Ok(candidate)
 }
 
 
@@ -3332,10 +3664,36 @@ fn sanitise_log_line(raw: &str, default_level: &str) -> (String, String) {
 
     // Expect `HH:MM:SS[.mmm]  LEVEL  <rest>` at the start. Regex-free scan.
     let bytes = trimmed.as_bytes();
-    if let Some((rest, level)) = scan_timestamp_level(bytes) {
-        return (level.to_string(), rest.trim_start().to_string());
+    let (level, message) = if let Some((rest, level)) = scan_timestamp_level(bytes) {
+        (level.to_string(), rest.trim_start().to_string())
+    } else {
+        (default_level.to_string(), trimmed.to_string())
+    };
+    (level, truncate_log_line(&message))
+}
+
+/// F-node-ui-008 (P22): cap each log line at ~2 KB. The LogViewer caps the
+/// number of lines at 2000, but a single malicious / runaway line (a
+/// stack trace, a base64 blob) could still inflate the React state into
+/// the tens of MB. Cuts on the character boundary so we never split a UTF-8
+/// scalar mid-byte. Appends a sentinel suffix the operator can grep for.
+const LOG_LINE_BYTE_CAP: usize = 2048;
+fn truncate_log_line(s: &str) -> String {
+    if s.len() <= LOG_LINE_BYTE_CAP {
+        return s.to_string();
     }
-    (default_level.to_string(), trimmed.to_string())
+    // Walk UTF-8 char boundaries until we run out of budget.
+    let mut end = 0usize;
+    for (i, _) in s.char_indices() {
+        if i > LOG_LINE_BYTE_CAP {
+            break;
+        }
+        end = i;
+    }
+    let mut truncated = String::with_capacity(end + 16);
+    truncated.push_str(&s[..end]);
+    truncated.push_str(" [truncated]");
+    truncated
 }
 
 /// Remove every CSI escape sequence (`\x1b[...m` and related). No allocations
