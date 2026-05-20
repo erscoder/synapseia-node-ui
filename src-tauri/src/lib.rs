@@ -1,7 +1,7 @@
 mod commands;
 
 use commands::{
-    check_capacity, check_external_lock, check_for_updates, create_wallet, docking_capabilities,
+    check_capacity, check_external_lock, coordinator_url, create_wallet, docking_capabilities,
     external_node_info, fetch_chain_info, force_release_lock, get_node_logs, get_ui_settings,
     install_python_deps, install_synapseia_node, node_status, reap_on_exit, run_command,
     set_ui_settings, start_node, stop_node, system_info, unlock_wallet, wallet_exists,
@@ -45,9 +45,9 @@ pub fn run() {
             force_release_lock,
             fetch_chain_info,
             system_info,
-            check_for_updates,
             docking_capabilities,
             check_capacity,
+            coordinator_url,
             install_synapseia_node,
             install_python_deps,
             get_ui_settings,

@@ -1,5 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -23,21 +22,27 @@ const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
 export function useUpdateChecker() {
   const [state, setState] = useState<UpdateState>(INITIAL);
+  // F-node-ui-019 (PERF): mirror `installing` into a ref so the
+  // periodic interval can early-exit without re-creating itself every
+  // time the state flips. The interval body always reads the latest
+  // value via the ref.
+  const installingRef = useRef(false);
 
   const checkForUpdate = useCallback(async () => {
+    // F-node-ui-019: never poll while an install is in flight — a
+    // mid-install `check()` races the downloader inside the plugin and
+    // surfaces as a confusing "update vanished" UI flicker.
+    if (installingRef.current) return;
     try {
-      const info = await invoke<{
-        available: boolean;
-        version: string | null;
-        body: string | null;
-      }>("check_for_updates");
-
-      if (info.available) {
+      // F-node-ui-015 (P10): call the updater plugin directly. The Rust
+      // `check_for_updates` IPC wrapper has been removed.
+      const update = await check();
+      if (update) {
         setState((prev) => ({
           ...prev,
           available: true,
-          version: info.version,
-          body: info.body,
+          version: update.version ?? null,
+          body: update.body ?? null,
           error: null,
         }));
       }
@@ -48,6 +53,7 @@ export function useUpdateChecker() {
   }, []);
 
   const installUpdate = useCallback(async () => {
+    installingRef.current = true;
     setState((prev) => ({ ...prev, installing: true, error: null }));
     try {
       const update = await check();
@@ -56,6 +62,7 @@ export function useUpdateChecker() {
         await relaunch();
       }
     } catch (e) {
+      installingRef.current = false;
       setState((prev) => ({
         ...prev,
         installing: false,
@@ -65,6 +72,7 @@ export function useUpdateChecker() {
   }, []);
 
   const dismiss = useCallback(() => {
+    installingRef.current = false;
     setState(INITIAL);
   }, []);
 

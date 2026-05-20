@@ -53,6 +53,13 @@ flate2 = "1"
 xz2 = { version = "0.1", features = ["static"] }
 # Windows Node tarballs are .zip.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# F-node-ui-016 (P29): strict 32-byte base58 decode for the wallet
+# pubkey sentinel. The old length-range + charset check accepted any
+# 32–44-character base58 string, which is sloppy enough that a
+# malformed CLI log line could surface as a "wallet" in the UI. The
+# `bs58` crate is already in the workspace via the node CLI; pinning it
+# here keeps the supply-chain audit explicit (cf. P13 dual-decl rule).
+bs58 = "0.5"
 # F-node-ui-012 (P10): persist the LLM API key in the OS keyring
 # (macOS Keychain, Linux Secret Service, Windows Credential Locker).
 # Falls back to a plaintext field in ui-settings.json when the keyring

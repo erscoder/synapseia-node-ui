@@ -7,7 +7,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_updater::UpdaterExt;
+// F-node-ui-015: updater is now driven from the frontend via
+// `@tauri-apps/plugin-updater`; the Rust-side `UpdaterExt` import is no
+// longer needed.
 
 // Hard cap for quick, read-only CLI invocations (wallet-verify, config, etc).
 // 30 s is generous for a NestJS cold start but prevents an indefinite UI hang.
@@ -1172,6 +1174,16 @@ fn read_coordinator_url() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "https://api.synapseia.network".to_string())
+}
+
+/// Expose the coordinator URL currently in effect so the desktop UI
+/// can display it as a subtitle (operators set `COORDINATOR_URL` via
+/// the .desktop launcher; the UI does not expose a Settings field for
+/// it). F-node-ui-014 (P10): without this the env-var override is
+/// invisible to power users.
+#[tauri::command]
+pub fn coordinator_url() -> String {
+    read_coordinator_url()
 }
 
 /// Pre-flight the closed-beta capacity gate by hitting the coordinator's
@@ -3634,21 +3646,16 @@ fn extract_pubkey(s: &str) -> Option<String> {
 }
 
 fn is_base58_pubkey(s: &str) -> bool {
-    let len = s.chars().count();
-    if !(32..=44).contains(&len) {
-        return false;
+    // F-node-ui-016 (P29): Solana pubkeys are exactly 32 raw bytes; the
+    // base58 encoding lives in the 32..=44 character window but the only
+    // way to *prove* a candidate is a valid pubkey is to decode it and
+    // assert the byte length. The old charset-only scan accepted any
+    // 32–44 base58-shaped token, including 33-byte garbage from a
+    // malformed CLI log line.
+    match bs58::decode(s).into_vec() {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
     }
-    s.chars().all(|c| {
-        matches!(
-            c,
-            '1'..='9'
-                | 'A'..='H'
-                | 'J'..='N'
-                | 'P'..='Z'
-                | 'a'..='k'
-                | 'm'..='z'
-        )
-    })
 }
 
 /// The node CLI's logger prepends every line with ANSI colour codes plus a
@@ -3778,42 +3785,12 @@ fn now_hhmmss() -> String {
 }
 
 // ── Update checker ──────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct UpdateInfo {
-    pub available: bool,
-    pub version: Option<String>,
-    pub body: Option<String>,
-}
-
-#[tauri::command]
-pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
-    let updater = app
-        .updater_builder()
-        .build()
-        .map_err(|e| format!("Updater init failed: {}", e))?;
-
-    match updater.check().await {
-        Ok(Some(update)) => Ok(UpdateInfo {
-            available: true,
-            version: Some(update.version.clone()),
-            body: update.body.clone(),
-        }),
-        Ok(None) => Ok(UpdateInfo {
-            available: false,
-            version: None,
-            body: None,
-        }),
-        Err(e) => {
-            log::warn!("Update check failed: {}", e);
-            Ok(UpdateInfo {
-                available: false,
-                version: None,
-                body: None,
-            })
-        }
-    }
-}
+//
+// F-node-ui-015 (P10): the Rust `check_for_updates` command was removed.
+// The frontend now drives the updater plugin directly via
+// `@tauri-apps/plugin-updater::check()`. Removing the IPC wrapper cuts
+// a round-trip per poll and shrinks the attack surface (no Rust-side
+// re-encoding of `UpdateInfo`).
 
 // ── Molecular docking capability check ────────────────────────────────────
 

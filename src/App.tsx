@@ -147,6 +147,24 @@ function AppInner() {
     current: number;
   }>({ open: false, limit: 0, current: 0 });
   const update = useUpdateChecker();
+  // F-node-ui-014 (P10): surface the active coordinator URL in the
+  // MyNode subtitle. Operators set `COORDINATOR_URL` via the .desktop
+  // launcher (we do not expose a Settings field), so without this the
+  // override is otherwise invisible. Read once on mount; the URL is
+  // resolved at process-start on the Rust side and cannot change while
+  // the desktop is running.
+  const [coordinatorUrl, setCoordinatorUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string>("coordinator_url")
+      .then((url) => {
+        if (!cancelled) setCoordinatorUrl(url);
+      })
+      .catch((e) => console.warn("coordinator_url failed", e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // Lock-conflict banner state. Polls ~/.synapseia/node.lock every 3 s so
   // operators see immediate feedback when a CLI-spawned node (or a zombie
   // lock file) is preventing Start from working. Refresh manually after
@@ -358,56 +376,63 @@ function AppInner() {
   const handleStartNode = useCallback(async () => {
     if (installingRef.current) return;
     if (!password) return;
+    // F-node-ui-017 (P14): claim the re-entrancy guard UNCONDITIONALLY at
+    // the top of the function and release it from a single `finally` at
+    // the bottom. The previous shape set the flag *after* the capacity
+    // pre-flight (a multi-second network call), so a frantic
+    // double-click during that window could spawn two `start_node`
+    // invocations in parallel — both would observe `installingRef.current
+    // === false` because the flag hadn't been claimed yet.
+    installingRef.current = true;
     // Clear any prior start error so the user sees a fresh attempt.
     setStartError(null);
-    // Pre-flight capacity probe. We hit the coordinator's public
-    // `/peer/capacity` endpoint BEFORE spawning the CLI; on a
-    // closed-beta full house we surface the modal instantly without
-    // the multi-second cold-start of the node binary. Network errors
-    // are NOT treated as a beta-limit signal — false positives are
-    // worse than the small race window we have anyway. Errors fall
-    // through to `start_node`, which surfaces them through the
-    // existing error path / log viewer.
     try {
-      const cap = await invoke<CapacityResponse>("check_capacity");
-      if (!cap.accepting) {
-        setBetaLimitModal({ open: true, limit: cap.limit, current: cap.current });
-        return;
-      }
-    } catch (err) {
-      console.warn("check_capacity failed; proceeding to start_node", err);
-    }
-
-    installingRef.current = true;
-    try {
-      const status = await invoke<NodeStatus>("start_node", { password });
-      setNodeStatus(status);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("ERR_CLI_MISSING")) {
-        setBootPhase("installing-node");
-        setInstallError(null);
-        setInstallProgress("Preparing installer…");
-        try {
-          await invoke<string>("install_synapseia_node");
-          const status = await invoke<NodeStatus>("start_node", { password });
-          setNodeStatus(status);
-          setBootPhase("unlocked");
-        } catch (installErr) {
-          const ierr = installErr instanceof Error ? installErr.message : String(installErr);
-          setInstallError(ierr);
-        } finally {
-          installingRef.current = false;
+      // Pre-flight capacity probe. We hit the coordinator's public
+      // `/peer/capacity` endpoint BEFORE spawning the CLI; on a
+      // closed-beta full house we surface the modal instantly without
+      // the multi-second cold-start of the node binary. Network errors
+      // are NOT treated as a beta-limit signal — false positives are
+      // worse than the small race window we have anyway. Errors fall
+      // through to `start_node`, which surfaces them through the
+      // existing error path / log viewer.
+      try {
+        const cap = await invoke<CapacityResponse>("check_capacity");
+        if (!cap.accepting) {
+          setBetaLimitModal({ open: true, limit: cap.limit, current: cap.current });
+          return;
         }
-        return;
+      } catch (err) {
+        console.warn("check_capacity failed; proceeding to start_node", err);
       }
-      // Generic non-CLI-missing errors (already-running, lock-claimed,
-      // capacity rejection from the CLI itself, etc). Surface to the UI —
-      // do NOT swallow into console.error only, that was the original bug.
-      console.error("Failed to start node", e);
-      setStartError(msg);
-      // Lock state may have flipped under us; refresh the banner.
-      void refreshLock();
+
+      try {
+        const status = await invoke<NodeStatus>("start_node", { password });
+        setNodeStatus(status);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes("ERR_CLI_MISSING")) {
+          setBootPhase("installing-node");
+          setInstallError(null);
+          setInstallProgress("Preparing installer…");
+          try {
+            await invoke<string>("install_synapseia_node");
+            const status = await invoke<NodeStatus>("start_node", { password });
+            setNodeStatus(status);
+            setBootPhase("unlocked");
+          } catch (installErr) {
+            const ierr = installErr instanceof Error ? installErr.message : String(installErr);
+            setInstallError(ierr);
+          }
+          return;
+        }
+        // Generic non-CLI-missing errors (already-running, lock-claimed,
+        // capacity rejection from the CLI itself, etc). Surface to the UI —
+        // do NOT swallow into console.error only, that was the original bug.
+        console.error("Failed to start node", e);
+        setStartError(msg);
+        // Lock state may have flipped under us; refresh the banner.
+        void refreshLock();
+      }
     } finally {
       installingRef.current = false;
     }
@@ -521,15 +546,23 @@ function AppInner() {
     );
   }
 
+  // F-node-ui-018 (STYLE): the BetaLimitModal was previously rendered
+  // twice — once in the `needs-activation` branch and again in the main
+  // panel return. Lift it to a single root wrapper so the modal exists
+  // exactly once regardless of `bootPhase`.
+  const betaModal = (
+    <BetaLimitModal
+      open={betaLimitModal.open}
+      limit={betaLimitModal.limit}
+      current={betaLimitModal.current}
+      onClose={() => setBetaLimitModal((s) => ({ ...s, open: false }))}
+    />
+  );
+
   if (bootPhase === "needs-activation" && walletAddress && password) {
     return (
       <>
-        <BetaLimitModal
-          open={betaLimitModal.open}
-          limit={betaLimitModal.limit}
-          current={betaLimitModal.current}
-          onClose={() => setBetaLimitModal((s) => ({ ...s, open: false }))}
-        />
+        {betaModal}
         <ActivationScreen
           walletAddress={walletAddress}
           password={password}
@@ -544,12 +577,7 @@ function AppInner() {
 
   return (
     <div className="flex h-screen text-slate-100 font-mono">
-      <BetaLimitModal
-        open={betaLimitModal.open}
-        limit={betaLimitModal.limit}
-        current={betaLimitModal.current}
-        onClose={() => setBetaLimitModal((s) => ({ ...s, open: false }))}
-      />
+      {betaModal}
       <Sidebar
         activePanel={activePanel}
         onPanelChange={setActivePanel}
@@ -602,6 +630,7 @@ function AppInner() {
             onOpenLogs={() => setActivePanel("logs")}
             onRefresh={refreshChainInfo}
             startDisabled={!!externalLock}
+            coordinatorUrl={coordinatorUrl}
           />
         )}
         {activePanel === "wallet" && (
