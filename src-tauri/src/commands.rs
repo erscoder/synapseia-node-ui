@@ -96,6 +96,331 @@ fn timeout_for(command: &str) -> Duration {
     }
 }
 
+// ─── run_command allowlist + per-command argv validation ─────────────────────
+//
+// SECURITY (F-node-ui-001): `run_command` is invoked from React via Tauri IPC
+// with a free-form `command` string and `args: Vec<String>`. The wallet
+// password is injected into the spawned Node process via the
+// `SYNAPSEIA_WALLET_PASSWORD` env var.
+//
+// Without an allowlist a renderer-side XSS / compromised dependency / devtools
+// call could invoke arbitrary `node` flags through the positional `command`
+// slot — e.g. `invoke('run_command', { command: '--inspect-brk=0.0.0.0:9229' })`
+// — which would attach a remote debugger to a Node.js process holding the
+// cached wallet password in its environment. With `withGlobalTauri: true`
+// (F-006) any iframe could reach the same surface.
+//
+// Defence-in-depth:
+//   1. Hard allowlist `ALLOWED_COMMANDS` of CLI subcommands actually invoked
+//      by the React UI. Anything else is rejected before reaching `node`.
+//   2. Per-command argv shape validation (`validate_command_args`) that
+//      caps argc, restricts the alphabet of positional args, and only
+//      permits the specific `--flag value` pairs each subcommand expects.
+//   3. Any arg that begins with `-` is rejected unless explicitly listed as
+//      an allowed flag for that subcommand — this blocks Node.js runtime
+//      flag injection through the positional slot (`--inspect`, `--require`,
+//      `--experimental-loader`, etc.).
+
+/// CLI subcommands the React UI is permitted to invoke via `run_command`.
+/// Derived from the call sites:
+///   * MyNodePanel.tsx      → claim-wo-rewards
+///   * WalletPanel.tsx      → withdraw-sol, withdraw-syn, export-key
+///   * StakePanel.tsx       → stake, unstake
+///   * SettingsPanel.tsx    → config (--show, --set-name, --set-model,
+///                                    --set-llm-key, --set-llm-url, --set-rpc-url)
+/// `node` runtime flags (`--inspect`, `-r`, etc.) MUST NOT appear here — they
+/// would bypass the `-` prefix guard and re-open the remote-debugger attack.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "stake",
+    "unstake",
+    "claim-rewards",
+    "claim-wo-rewards",
+    "withdraw-sol",
+    "withdraw-syn",
+    "deposit-sol",
+    "deposit-syn",
+    "export-key",
+    "config",
+];
+
+/// Whitelisted `--flag` names for the `config` subcommand. Anything that
+/// looks like a flag (starts with `-`) and is not in this list is rejected
+/// up front, defeating attempts to smuggle `--inspect-brk` etc. through the
+/// `config` positional slot.
+const ALLOWED_CONFIG_FLAGS: &[&str] = &[
+    "--show",
+    "--set-name",
+    "--set-model",
+    "--set-llm-key",
+    "--set-llm-url",
+    "--set-rpc-url",
+];
+
+/// Maximum length of any single positional argument or `--flag` value.
+/// Generous enough to cover Solana base58 addresses (≤ 44 chars), provider/
+/// model slugs, JWT-shaped LLM API keys, and RPC URLs, while still keeping
+/// the surface bounded.
+const MAX_ARG_LEN: usize = 512;
+
+/// True for ASCII positional-argument character classes: base58 (digits +
+/// letters minus 0/O/I/l), numeric amounts (digits, `.`), and common URL /
+/// model-slug punctuation. Deliberately conservative — anything outside the
+/// set is rejected.
+fn is_safe_positional_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '+' | '=' | '?' | '&' | '%')
+}
+
+/// Validate one positional argument: length-capped, ASCII-only, drawn from
+/// `is_safe_positional_char`, and MUST NOT start with `-` (would be a flag).
+fn validate_positional(arg: &str, ctx: &str) -> Result<(), String> {
+    if arg.is_empty() {
+        return Err(format!("Invalid {ctx}: empty argument"));
+    }
+    if arg.len() > MAX_ARG_LEN {
+        return Err(format!("Invalid {ctx}: argument exceeds {MAX_ARG_LEN} bytes"));
+    }
+    if arg.starts_with('-') {
+        return Err(format!(
+            "Invalid {ctx}: positional arguments must not start with '-' (would be parsed as a flag)"
+        ));
+    }
+    if !arg.chars().all(is_safe_positional_char) {
+        return Err(format!(
+            "Invalid {ctx}: argument contains characters outside the safe set"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a `--flag value` pair for the `config` subcommand. `--show` is
+/// a no-value flag and is handled separately by the caller.
+fn validate_config_flag_value(flag: &str, value: &str) -> Result<(), String> {
+    if !ALLOWED_CONFIG_FLAGS.contains(&flag) {
+        return Err(format!("Invalid config flag: {flag}"));
+    }
+    if value.len() > MAX_ARG_LEN {
+        return Err(format!(
+            "Invalid config value for {flag}: exceeds {MAX_ARG_LEN} bytes"
+        ));
+    }
+    // The CLI itself accepts `""` as a meaningful "clear this value" signal
+    // for some flags (e.g. --set-rpc-url). Empty is allowed; non-empty must
+    // be control-char-free.
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "Invalid config value for {flag}: contains control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the per-command argv shape rules. Returns `Ok(())` if `command +
+/// args` is a legal shape the CLI is willing to receive from the UI.
+///
+/// Any argv shape the React UI does not actually produce is rejected here,
+/// even if the underlying CLI would accept it. Tighten / loosen alongside
+/// the call-site grep, never to make a new test pass.
+fn validate_command_args(command: &str, args: &[String]) -> Result<(), String> {
+    if !ALLOWED_COMMANDS.contains(&command) {
+        return Err(format!(
+            "Command `{command}` is not in the allowlist. Refusing to invoke."
+        ));
+    }
+
+    match command {
+        // Single positional <amount> (numeric SYN value, validated upstream
+        // by the React UI; we only enforce shape here).
+        "stake" | "unstake" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "`{command}` expects exactly 1 argument (amount); got {}",
+                    args.len()
+                ));
+            }
+            validate_positional(&args[0], command)?;
+        }
+
+        // `withdraw-sol` / `withdraw-syn` accept either:
+        //   [destination]                 (UI sends when amount field empty)
+        //   [amount, destination]
+        // Both positional. The CLI itself parses amount as a number and
+        // destination as a Solana address — we just enforce shape.
+        "withdraw-sol" | "withdraw-syn" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(format!(
+                    "`{command}` expects 1 or 2 arguments; got {}",
+                    args.len()
+                ));
+            }
+            for a in args {
+                validate_positional(a, command)?;
+            }
+        }
+
+        // `deposit-sol <amount>` / `deposit-syn [amount]`. Currently not
+        // wired from the UI but kept in the allowlist for parity with
+        // ON_CHAIN_COMMANDS / future wiring.
+        "deposit-sol" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "`{command}` expects exactly 1 argument (amount); got {}",
+                    args.len()
+                ));
+            }
+            validate_positional(&args[0], command)?;
+        }
+        "deposit-syn" => {
+            if args.len() > 1 {
+                return Err(format!(
+                    "`{command}` expects 0 or 1 argument; got {}",
+                    args.len()
+                ));
+            }
+            if let Some(a) = args.first() {
+                validate_positional(a, command)?;
+            }
+        }
+
+        // Zero-arg commands.
+        "claim-rewards" | "claim-wo-rewards" | "export-key" => {
+            if !args.is_empty() {
+                return Err(format!(
+                    "`{command}` expects no arguments; got {}",
+                    args.len()
+                ));
+            }
+        }
+
+        // `config` is the only command that accepts flags. Allowed shapes:
+        //   ["--show"]                   (one no-value flag)
+        //   ["--set-foo", "<value>"]     (single setter call)
+        // The UI never batches multiple setters into one invocation — it
+        // loops and calls `config` once per flag (see SettingsPanel.tsx).
+        "config" => {
+            match args.len() {
+                1 => {
+                    if args[0] != "--show" {
+                        return Err(format!(
+                            "`config` with a single arg only accepts `--show`; got `{}`",
+                            args[0]
+                        ));
+                    }
+                }
+                2 => {
+                    validate_config_flag_value(&args[0], &args[1])?;
+                    if args[0] == "--show" {
+                        return Err(
+                            "`config --show` does not take a value".to_string()
+                        );
+                    }
+                }
+                n => {
+                    return Err(format!(
+                        "`config` expects 1 or 2 arguments; got {n}"
+                    ));
+                }
+            }
+        }
+
+        // Should be unreachable because of the ALLOWED_COMMANDS gate above,
+        // but fail closed if the lists ever drift.
+        _ => {
+            return Err(format!(
+                "Command `{command}` is allowlisted but has no argv validator. Refusing to invoke."
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod run_command_validation_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rejects_unknown_command() {
+        assert!(validate_command_args("rm", &s(&["-rf", "/"])).is_err());
+        assert!(validate_command_args("--inspect-brk=0.0.0.0:9229", &[]).is_err());
+        assert!(validate_command_args("-r", &s(&["evil.js"])).is_err());
+    }
+
+    #[test]
+    fn rejects_node_flag_injection_through_positional() {
+        // Caller tries to smuggle `--inspect` through a known subcommand.
+        assert!(validate_command_args("stake", &s(&["--inspect-brk=0.0.0.0:9229"])).is_err());
+        assert!(validate_command_args("withdraw-sol", &s(&["--require", "evil.js"])).is_err());
+        assert!(validate_command_args("claim-wo-rewards", &s(&["-e", "process.exit()"])).is_err());
+    }
+
+    #[test]
+    fn accepts_known_happy_paths() {
+        assert!(validate_command_args("stake", &s(&["100"])).is_ok());
+        assert!(validate_command_args("unstake", &s(&["50.5"])).is_ok());
+        assert!(validate_command_args("claim-wo-rewards", &[]).is_ok());
+        assert!(validate_command_args("export-key", &[]).is_ok());
+        assert!(validate_command_args(
+            "withdraw-sol",
+            &s(&["0.1", "5xJ7sN8YbqXz3Wp2K9aL1Q4mF6tV8R2c"])
+        )
+        .is_ok());
+        assert!(validate_command_args(
+            "withdraw-syn",
+            &s(&["5xJ7sN8YbqXz3Wp2K9aL1Q4mF6tV8R2c"])
+        )
+        .is_ok());
+        assert!(validate_command_args("config", &s(&["--show"])).is_ok());
+        assert!(
+            validate_command_args("config", &s(&["--set-name", "my-node"])).is_ok()
+        );
+        assert!(validate_command_args(
+            "config",
+            &s(&["--set-model", "openai/gpt-4o-mini"])
+        )
+        .is_ok());
+        assert!(validate_command_args(
+            "config",
+            &s(&["--set-rpc-url", "https://api.devnet.solana.com"])
+        )
+        .is_ok());
+        // Empty value is permitted for `--set-rpc-url` (clear-to-default).
+        assert!(validate_command_args("config", &s(&["--set-rpc-url", ""])).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_config_flag() {
+        assert!(
+            validate_command_args("config", &s(&["--set-keystore-path", "/etc/passwd"]))
+                .is_err()
+        );
+        assert!(validate_command_args("config", &s(&["--show", "extra"])).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_argc() {
+        assert!(validate_command_args("stake", &[]).is_err());
+        assert!(validate_command_args("stake", &s(&["1", "2"])).is_err());
+        assert!(validate_command_args("withdraw-sol", &[]).is_err());
+        assert!(
+            validate_command_args("withdraw-sol", &s(&["a", "b", "c"])).is_err()
+        );
+        assert!(validate_command_args("export-key", &s(&["leak"])).is_err());
+    }
+
+    #[test]
+    fn rejects_control_chars_and_oversized_values() {
+        let big = "a".repeat(MAX_ARG_LEN + 1);
+        assert!(validate_command_args("stake", &[big]).is_err());
+        assert!(
+            validate_command_args("config", &s(&["--set-name", "evil\nname"])).is_err()
+        );
+    }
+}
+
 pub struct NodeProcess {
     child: Option<Child>,
     logs: Arc<Mutex<Vec<String>>>,
@@ -1516,6 +1841,21 @@ pub async fn run_command(
     args: Vec<String>,
     password: Option<String>,
 ) -> Result<CommandResult, String> {
+    // SECURITY (F-node-ui-001): hard allowlist + per-command argv shape
+    // validation BEFORE we hand anything to `node`. Without this guard a
+    // renderer-side XSS / compromised dep / devtools call could pass a
+    // Node.js flag (`--inspect-brk=0.0.0.0:9229`) through `command` and
+    // attach a remote debugger to a process holding the cached wallet
+    // password in `SYNAPSEIA_WALLET_PASSWORD`. See ALLOWED_COMMANDS /
+    // validate_command_args above.
+    if let Err(msg) = validate_command_args(&command, &args) {
+        return Ok(CommandResult {
+            success: false,
+            output: String::new(),
+            error: Some(msg),
+        });
+    }
+
     let mut all_args: Vec<String> = vec![command.clone()];
     all_args.extend(args);
     let arg_refs: Vec<&str> = all_args.iter().map(|s| s.as_str()).collect();
