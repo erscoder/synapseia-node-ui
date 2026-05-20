@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -125,6 +125,51 @@ fn timeout_for(command: &str) -> Duration {
     } else {
         CLI_TIMEOUT
     }
+}
+
+/// F-node-008 (max-security): write the wallet passphrase to a freshly
+/// spawned child's stdin handle, then close the pipe. This replaces the
+/// historical `cmd.env("SYNAPSEIA_WALLET_PASSWORD", ...)` injection
+/// which was readable to any sibling at the same UID via
+/// `/proc/<pid>/environ`. Caller MUST have set
+/// `SYNAPSEIA_PASSPHRASE_FROM_STDIN=true` on the command before
+/// `spawn()`, otherwise the node CLI ignores stdin and falls through
+/// to its (TTY-less, blocking) interactive prompt.
+///
+/// We take owned `tokio::process::ChildStdin` (which is `Send`) instead
+/// of borrowing `&mut Child` across `.await` — the latter has shown
+/// itself non-`Send` under recent tokio releases and broke
+/// `tokio::spawn`-ability for the `handle_node_eof` respawn path.
+///
+/// We write `password + "\n"` and then drop the stdin handle so the
+/// child's `readline`-equivalent sees EOF immediately after the first
+/// line — no further reads can hang. Errors from the write are
+/// surfaced as `String` so the caller can include them in the
+/// structured `error` field of `UnlockResult` / `CommandResult`.
+async fn write_password_to_stdin(
+    mut stdin: tokio::process::ChildStdin,
+    password: &str,
+) -> Result<(), String> {
+    // The trailing newline is the line-delimiter contract with
+    // `readPassphraseFromStdin` on the node side (it reads exactly one
+    // line). We write the bytes in one shot — the password is small
+    // enough that partial writes are not a realistic concern, but
+    // `write_all` handles any short writes for free.
+    stdin
+        .write_all(password.as_bytes())
+        .await
+        .map_err(|e| format!("failed to write passphrase to child stdin: {}", e))?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|e| format!("failed to write passphrase newline: {}", e))?;
+    // Explicit shutdown so the child sees EOF and stops waiting for
+    // more stdin. Dropping `stdin` would also close it (kernel-level
+    // FD release) but `shutdown` flushes any pending tokio buffers
+    // first, which is the contract we want.
+    let _ = stdin.shutdown().await;
+    // `stdin` is dropped here, releasing the pipe.
+    Ok(())
 }
 
 /// F-node-ui-007: replace every occurrence of `password` in `s` with `***`.
@@ -1535,13 +1580,48 @@ pub async fn unlock_wallet(app: AppHandle, password: String) -> Result<UnlockRes
         });
     }
 
+    // F-node-008 (max-security): pipe the password to the spawned
+    // CLI's stdin instead of exporting it via env. See
+    // `write_password_to_stdin` for the contract with the node-side
+    // `readPassphraseFromStdin` helper.
     let mut cmd = build_node_command(Some(&app), &["wallet-verify"])?;
-    cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password);
+    cmd.env("SYNAPSEIA_PASSPHRASE_FROM_STDIN", "true");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
+    cmd.stdin(Stdio::piped());
 
-    let output = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(UnlockResult {
+                success: false,
+                wallet_address: None,
+                error_code: Some("SPAWN_FAILED".to_string()),
+                error_message: Some(format!(
+                    "Failed to run node CLI. Is Node.js installed? {}",
+                    e
+                )),
+            });
+        }
+    };
+
+    let stdin_handle = child
+        .stdin
+        .take()
+        .ok_or_else(|| "child stdin handle not piped".to_string())?;
+    if let Err(e) = write_password_to_stdin(stdin_handle, &password).await {
+        // Best-effort kill — if the write fails the child is in an
+        // undefined state and we must not let it inherit the prompt.
+        let _ = child.start_kill();
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("STDIN_WRITE_FAILED".to_string()),
+            error_message: Some(e),
+        });
+    }
+
+    let output = match tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return Ok(UnlockResult {
@@ -1677,12 +1757,42 @@ pub async fn create_wallet(
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut cmd = build_node_command(Some(&app), &arg_refs)?;
-    cmd.env("SYNAPSEIA_WALLET_PASSWORD", &password);
+    // F-node-008: pipe passphrase via stdin instead of env.
+    cmd.env("SYNAPSEIA_PASSPHRASE_FROM_STDIN", "true");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
+    cmd.stdin(Stdio::piped());
 
-    let output = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(UnlockResult {
+                success: false,
+                wallet_address: None,
+                error_code: Some("SPAWN_FAILED".to_string()),
+                error_message: Some(format!(
+                    "Failed to run node CLI. Is Node.js installed? {}",
+                    e
+                )),
+            });
+        }
+    };
+
+    let stdin_handle = child
+        .stdin
+        .take()
+        .ok_or_else(|| "child stdin handle not piped".to_string())?;
+    if let Err(e) = write_password_to_stdin(stdin_handle, &password).await {
+        let _ = child.start_kill();
+        return Ok(UnlockResult {
+            success: false,
+            wallet_address: None,
+            error_code: Some("STDIN_WRITE_FAILED".to_string()),
+            error_message: Some(e),
+        });
+    }
+
+    let output = match tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return Ok(UnlockResult {
@@ -1843,10 +1953,18 @@ fn spawn_node_into_state(
     let nonce = generate_self_update_nonce();
 
     let mut cmd = build_node_command(Some(app), &["start"])?;
-    cmd.env("SYNAPSEIA_WALLET_PASSWORD", password)
+    // F-node-008 (max-security): pipe the wallet passphrase to the
+    // spawned node's stdin instead of exporting it via env. The env
+    // var was readable to any sibling at the same UID via
+    // `/proc/<pid>/environ` and was inherited by every python /
+    // ollama / external subprocess the node itself spawned. Stdin
+    // closes immediately after the first line so subsequent reads
+    // (e.g. an unwary library tailing stdin) see EOF.
+    cmd.env("SYNAPSEIA_PASSPHRASE_FROM_STDIN", "true")
         .env("SYNAPSEIA_LAUNCH_SOURCE", "ui")
         .env("SYNAPSEIA_SELF_UPDATE_NONCE", &nonce)
         .env("NODE_ENV", "production")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1868,6 +1986,43 @@ fn spawn_node_into_state(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn node process: {}", e))?;
+
+    // F-node-008: write the wallet passphrase to the child's stdin
+    // immediately after spawn, then close the pipe. The node CLI
+    // (with SYNAPSEIA_PASSPHRASE_FROM_STDIN=true) reads exactly one
+    // line and treats EOF afterwards as "no more input".
+    //
+    // We deliberately fire-and-forget the write on a fresh tokio task
+    // so this function stays synchronous — the `handle_node_eof`
+    // respawn caller spawns `spawn_node_into_state` inside another
+    // `tokio::spawn` whose future MUST be `Send`; awaiting the write
+    // here would propagate a non-Send borrow up through the call
+    // chain. The write completes long before the child is far enough
+    // along to read its stdin, so timing is not an issue; and a
+    // failure to write surfaces as either:
+    //   (a) the child timing out on its own readline (then exiting
+    //       with an error the operator sees in the log forwarder),
+    //   (b) an EOF on stdin which the node-side stdin reader
+    //       interprets as "no passphrase, fall back to TTY prompt"
+    //       and then exits because TTY is unavailable.
+    // Either path is safe — no half-decrypted state, no hung child.
+    let stdin_handle = child
+        .stdin
+        .take()
+        .ok_or_else(|| "child stdin handle not piped".to_string())?;
+    let pw_owned: String = password.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = write_password_to_stdin(stdin_handle, &pw_owned).await {
+            eprintln!("[synapseia-node-ui] failed to seed wallet passphrase via stdin: {}", e);
+        }
+        // pw_owned is dropped at end of this scope. Zeroize the
+        // contents first so the heap allocation doesn't linger with
+        // the secret bytes — matches the F-node-ui-005 Zeroizing
+        // discipline applied elsewhere.
+        use zeroize::Zeroize;
+        let mut pw = pw_owned;
+        pw.zeroize();
+    });
 
     let pid = child.id();
 
@@ -2258,16 +2413,58 @@ pub async fn run_command(
     let arg_refs: Vec<&str> = all_args.iter().map(|s| s.as_str()).collect();
 
     let mut cmd = build_node_command(Some(&app), &arg_refs)?;
-    if let Some(ref pwd) = password {
-        cmd.env("SYNAPSEIA_WALLET_PASSWORD", pwd);
-    }
     cmd.env("NODE_ENV", "production");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
+    // F-node-008: when a password is provided, feed it via stdin
+    // instead of env (see write_password_to_stdin contract). When no
+    // password is needed the child gets a closed stdin (Stdio::null()).
+    let needs_password = password.is_some();
+    if needs_password {
+        cmd.env("SYNAPSEIA_PASSPHRASE_FROM_STDIN", "true");
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(CommandResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Failed to run node CLI ({}): {}. Is Node.js installed?",
+                    command, e
+                )),
+            });
+        }
+    };
+
+    if let Some(ref pwd) = password {
+        let stdin_handle = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.start_kill();
+                return Ok(CommandResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("child stdin handle not piped".to_string()),
+                });
+            }
+        };
+        if let Err(e) = write_password_to_stdin(stdin_handle, pwd).await {
+            let _ = child.start_kill();
+            return Ok(CommandResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+            });
+        }
+    }
 
     let effective_timeout = timeout_for(&command);
-    let output = match tokio::time::timeout(effective_timeout, cmd.output()).await {
+    let output = match tokio::time::timeout(effective_timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return Ok(CommandResult {
