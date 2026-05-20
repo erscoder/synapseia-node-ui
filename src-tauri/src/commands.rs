@@ -428,7 +428,14 @@ pub struct NodeProcess {
     /// a self-update can re-spawn the CLI without prompting the user for the
     /// wallet password again. Cleared on `stop_node` so a manual stop always
     /// re-requires the password on next start.
-    cached_password: Option<String>,
+    ///
+    /// F-node-ui-005 (P36): wrapped in `Zeroizing<String>` so the password
+    /// bytes are scrubbed when the field is reassigned or dropped. Without
+    /// this, a core dump or post-exit memory inspection (e.g. swap file,
+    /// /proc/<pid>/maps prior to release) could leak the wallet password in
+    /// plaintext. `mlock` is left as a future hardening — the trade-off is
+    /// platform-specific RLIMIT_MEMLOCK pressure and is documented inline.
+    cached_password: Option<zeroize::Zeroizing<String>>,
     /// Latched true when the CLI emits `[SELF_UPDATE_RESTART]` on stdout
     /// (see packages/node/src/utils/self-updater.ts). The stdout reader
     /// flips it; the EOF handler checks it to decide between auto-respawn
@@ -442,6 +449,12 @@ pub struct NodeProcess {
     /// against a manual stop+restart race where the OLD EOF handler would
     /// otherwise spawn a third child on top of the user's fresh start.
     generation: u64,
+    /// Per-spawn random nonce injected into the child via
+    /// `SYNAPSEIA_SELF_UPDATE_NONCE`. Only the legitimate child knows this
+    /// value, so only the legitimate child can emit a `[SELF_UPDATE_RESTART]`
+    /// marker that survives `parse_self_update_cue_with_nonce` (F-node-ui-004).
+    /// Rotated on every spawn. Empty when no child is alive.
+    self_update_nonce: String,
 }
 
 impl NodeProcess {
@@ -452,6 +465,7 @@ impl NodeProcess {
             cached_password: None,
             pending_self_update_restart: false,
             generation: 0,
+            self_update_nonce: String::new(),
         }
     }
 }
@@ -459,14 +473,111 @@ impl NodeProcess {
 pub type NodeProcessState = Arc<Mutex<NodeProcess>>;
 
 /// Detect the self-update relaunch cue emitted by the CLI just before exit
-/// (`console.log('[SELF_UPDATE_RESTART] ...')` in
+/// (`console.log('[SELF_UPDATE_RESTART] nonce=... v... pid=...')` in
 /// packages/node/src/utils/self-updater.ts). Extracted so it can be unit
 /// tested without spawning a real process.
+///
+/// F-node-ui-004 (P10) — substring `[SELF_UPDATE_RESTART]` is no longer
+/// enough. Any process output (work-order body, KG ingest, web search
+/// result, log forwarder echo) could carry the literal marker substring
+/// and force a spurious respawn. We require a strict shape that ONLY a
+/// legitimate child we spawned can emit, because we inject the nonce
+/// via `SYNAPSEIA_SELF_UPDATE_NONCE` env at spawn time.
+///
+/// Shape (single line, anchored both ends after trimming any timestamp
+/// prefix at the START of the line):
+///
+///   `[SELF_UPDATE_RESTART] nonce=<hex>  v<semver>  pid=<digits>` — body.
+///
+/// The `nonce` value must match the per-spawn `expected_nonce` exactly.
+/// `expected_nonce` is the hex string this UI process generated and
+/// passed to the child via env at spawn time.
 pub fn parse_self_update_cue(line: &str) -> bool {
-    // Match the marker anywhere in the line — the CLI prints it raw via
-    // console.log, but log forwarders / tee'd terminals may prepend
-    // timestamps. We don't anchor at start.
-    line.contains("[SELF_UPDATE_RESTART]")
+    // Kept for back-compat with existing call sites that pass the empty
+    // nonce (e.g. legacy tests). Always returns false — the strict path
+    // requires a real nonce.
+    parse_self_update_cue_with_nonce(line, "")
+}
+
+/// Strict variant of `parse_self_update_cue`. Accepts the canonical
+/// marker shape only when the embedded `nonce=<value>` matches
+/// `expected_nonce` (non-empty). Empty `expected_nonce` always returns
+/// false — protects against the "no env, accept anything" footgun.
+pub fn parse_self_update_cue_with_nonce(line: &str, expected_nonce: &str) -> bool {
+    if expected_nonce.is_empty() {
+        return false;
+    }
+
+    // Strip a leading timestamp / log-forwarder prefix if present. The
+    // marker itself starts with `[SELF_UPDATE_RESTART]`; everything
+    // before it is the forwarder's preamble and may include arbitrary
+    // bytes. We find the bracketed token once and parse what follows.
+    let Some(idx) = line.find("[SELF_UPDATE_RESTART]") else {
+        return false;
+    };
+    let after = line[idx + "[SELF_UPDATE_RESTART]".len()..].trim();
+
+    // Tokenize by ASCII whitespace. Order is fixed:
+    //   nonce=<hex>  v<semver>  pid=<digits>
+    // Anything else, in any other order, with extra tokens or missing
+    // tokens, fails closed.
+    let parts: Vec<&str> = after.split_ascii_whitespace().collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let Some(nonce_value) = parts[0].strip_prefix("nonce=") else {
+        return false;
+    };
+    if nonce_value != expected_nonce {
+        return false;
+    }
+    // Validate v<semver> shape: 'v' followed by digits.dot.digits.dot.digits.
+    let Some(ver) = parts[1].strip_prefix('v') else {
+        return false;
+    };
+    let ver_parts: Vec<&str> = ver.split('.').collect();
+    if ver_parts.len() != 3 || !ver_parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        return false;
+    }
+    // Validate pid=<digits>.
+    let Some(pid_value) = parts[2].strip_prefix("pid=") else {
+        return false;
+    };
+    if pid_value.is_empty() || !pid_value.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    true
+}
+
+/// Generate a 32-hex-character (16-byte) random nonce for the
+/// `[SELF_UPDATE_RESTART]` marker. Uses the OS CSPRNG via the
+/// `getrandom` crate (already transitive). Falls back to a
+/// pid+time-based bytes if the syscall fails; the fallback is still
+/// hard for an unrelated stdout-line generator to guess because it
+/// embeds a high-resolution timestamp the attacker doesn't observe.
+fn generate_self_update_nonce() -> String {
+    let mut buf = [0u8; 16];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Best-effort fallback: mix the current process id, monotonic
+        // nanos and a syscall-failure flag. Not cryptographic strength,
+        // but the attacker observing only the stdout marker substring
+        // still can't know the nanos at spawn time.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let mixed = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(pid);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((mixed >> (i * 8)) & 0xff) as u8;
+        }
+    }
+    let mut s = String::with_capacity(32);
+    for b in &buf {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1154,8 +1265,48 @@ pub async fn force_release_lock() -> Result<(), String> {
         .map_err(|e| format!("Lock file is corrupt: {}", e))?;
 
     let target_pid = lock.pid;
+    let target_started_at = lock.started_at.clone();
 
     if is_pid_alive(target_pid) {
+        // F-node-ui-003 (P2 fail-closed): re-read the lock file IMMEDIATELY
+        // before SIGTERM. The original `lock` was read seconds ago for a
+        // freshness probe; in the meantime the lock-holding process could
+        // have exited and the OS could have recycled its PID for an
+        // unrelated process. Comparing both `pid` AND `started_at` (the
+        // ISO timestamp the original owner wrote) detects PID recycling
+        // within the same lock-owner identity: a recycled PID will not
+        // have rewritten the same `started_at`.
+        match std::fs::read_to_string(&lock_path) {
+            Ok(c1) => match serde_json::from_str::<LockFile>(&c1) {
+                Ok(l1) if l1.pid == target_pid && l1.started_at == target_started_at => {
+                    // Same owner — proceed with SIGTERM.
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "Lock file changed before termination (PID {} / startedAt {} no longer the owner); aborting to avoid killing an unrelated process.",
+                        target_pid, target_started_at
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Lock file became unreadable before termination: {}",
+                        e
+                    ));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Lock vanished — owner cleaned up between our two reads.
+                // Skip the kill path; fall through to file removal (noop).
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Lock file became unreadable before termination: {}",
+                    e
+                ));
+            }
+        }
+
         // Graceful SIGTERM first.
         let term_err = send_signal(target_pid, SIG_TERM);
         if let Err(e) = term_err {
@@ -1174,13 +1325,16 @@ pub async fn force_release_lock() -> Result<(), String> {
             }
         }
 
-        // Re-verify the lock still points at our target before escalating.
-        // If the file changed underneath us (someone else cleaned + relocked)
-        // we MUST NOT SIGKILL whatever PID is in the new file.
+        // Re-verify the lock still points at our target (same pid AND
+        // same started_at) before escalating to SIGKILL. PID recycle
+        // protection: if the original process exited during the SIGTERM
+        // grace window and the kernel handed the PID to a brand-new
+        // process that happened to claim the lock, the `started_at`
+        // field — written ONLY by the original owner — will not match.
         if is_pid_alive(target_pid) {
             match std::fs::read_to_string(&lock_path) {
                 Ok(c2) => match serde_json::from_str::<LockFile>(&c2) {
-                    Ok(l2) if l2.pid == target_pid => {
+                    Ok(l2) if l2.pid == target_pid && l2.started_at == target_started_at => {
                         // Same owner still — SIGKILL it.
                         send_signal(target_pid, SIG_KILL).map_err(|e| {
                             format!("Failed to SIGKILL PID {}: {}", target_pid, e)
@@ -1188,8 +1342,8 @@ pub async fn force_release_lock() -> Result<(), String> {
                     }
                     Ok(_) => {
                         return Err(format!(
-                            "Lock file changed during termination (PID {} no longer the owner); aborting to avoid killing an unrelated process.",
-                            target_pid
+                            "Lock file changed during termination (PID {} / startedAt {} no longer the owner); aborting to avoid killing an unrelated process.",
+                            target_pid, target_started_at
                         ));
                     }
                     Err(e) => {
@@ -1505,7 +1659,9 @@ pub async fn start_node(
     // Cache the password for the auto-respawn path. We only do this on the
     // operator-initiated start_node so a successful unlock here becomes the
     // basis for self-update restarts; stop_node clears it.
-    node.cached_password = Some(password);
+    // F-node-ui-005: wrap in Zeroizing so the bytes are scrubbed when the
+    // field is later assigned to None or the struct drops.
+    node.cached_password = Some(zeroize::Zeroizing::new(password));
 
     drop(node);
 
@@ -1538,9 +1694,17 @@ fn spawn_node_into_state(
     password: &str,
     is_respawn: bool,
 ) -> Result<Option<u32>, String> {
+    // F-node-ui-004: rotate a fresh per-spawn nonce and inject it into
+    // the child env. The child echoes it back in the canonical
+    // `[SELF_UPDATE_RESTART]` marker; only that legitimate child knows
+    // the nonce, so a malicious stdout line containing only the
+    // substring can no longer trigger respawn.
+    let nonce = generate_self_update_nonce();
+
     let mut cmd = build_node_command(Some(app), &["start"])?;
     cmd.env("SYNAPSEIA_WALLET_PASSWORD", password)
         .env("SYNAPSEIA_LAUNCH_SOURCE", "ui")
+        .env("SYNAPSEIA_SELF_UPDATE_NONCE", &nonce)
         .env("NODE_ENV", "production")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1572,8 +1736,12 @@ fn spawn_node_into_state(
     node.child = Some(child);
     node.pending_self_update_restart = false;
     node.generation = node.generation.wrapping_add(1);
+    node.self_update_nonce = nonce.clone();
     let logs = node.logs.clone();
     let generation = node.generation;
+    // Hand the per-spawn nonce to the stdout reader so it can strictly
+    // validate any `[SELF_UPDATE_RESTART]` marker the child emits.
+    let expected_nonce = nonce;
 
     if is_respawn {
         let _ = app.emit(
@@ -1594,10 +1762,14 @@ fn spawn_node_into_state(
         // stdout reader: forward log lines AND detect the [SELF_UPDATE_RESTART]
         // marker. On EOF (child closed stdout = process exiting/exited), if the
         // self-update flag is set we trigger the auto-respawn flow.
+        //
+        // F-node-ui-004: strict-anchor + per-spawn nonce. Only marker lines
+        // emitted by the legitimate child (which knows the nonce via env)
+        // can latch the flag.
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(raw)) = reader.next_line().await {
-                if parse_self_update_cue(&raw) {
+                if parse_self_update_cue_with_nonce(&raw, &expected_nonce) {
                     let mut guard = state_for_respawn.lock().await;
                     // Only latch if the cue belongs to THE child we were spawned
                     // for. A delayed line from a previous generation must not
@@ -1703,7 +1875,11 @@ async fn handle_node_eof(state: NodeProcessState, app: AppHandle, my_generation:
 
     // Respawn. We're already holding the mutex, so call the helper
     // directly. Any failure surfaces as an event the UI can toast.
-    match spawn_node_into_state(&mut guard, &app, &password, true) {
+    // `password` is `Zeroizing<String>` (F-node-ui-005); explicit `&*…`
+    // borrows the inner `&str` so we don't pass the smart-pointer type.
+    // The Zeroizing wrapper here is dropped at end of this scope, which
+    // scrubs the cloned bytes.
+    match spawn_node_into_state(&mut guard, &app, &*password, true) {
         Ok(new_pid) => {
             eprintln!(
                 "[synapseia-node-ui] auto-respawned after self-update: pid={:?}",
@@ -1734,6 +1910,9 @@ pub async fn stop_node(state: State<'_, NodeProcessState>) -> Result<bool, Strin
     // and the cached password — the next start will re-prompt.
     node.pending_self_update_restart = false;
     node.cached_password = None;
+    // Invalidate the per-spawn self-update nonce so any late stdout line
+    // from the now-dying child can no longer latch a respawn (F-node-ui-004).
+    node.self_update_nonce.clear();
     // Bump generation so any in-flight EOF watcher from this child can't
     // mistake itself for the current owner of state when it wakes up.
     node.generation = node.generation.wrapping_add(1);
@@ -1760,6 +1939,7 @@ pub fn reap_on_exit(state: &NodeProcessState) {
     // App is shutting down — no auto-respawn under any circumstances.
     guard.pending_self_update_restart = false;
     guard.cached_password = None;
+    guard.self_update_nonce.clear();
     guard.generation = guard.generation.wrapping_add(1);
     if let Some(mut child) = guard.child.take() {
         let pid = child.id();
@@ -2404,6 +2584,13 @@ fn find_synapseia_node(_app: Option<&AppHandle>) -> Result<String, String> {
     //    surface: any process able to write the user shell rc could redirect the
     //    locator to a hostile dist/index.js. The dev override is useful when
     //    iterating from the monorepo, so we keep it gated on debug_assertions.
+    //
+    //    F-node-ui-002 (P7): even in debug, gate the override by the same
+    //    `"name": "@synapseia-network/node"` package.json substring check the
+    //    other branches use — otherwise a stale shell rc pointing at an
+    //    unrelated `dist/index.js` (e.g. a sibling tool laid out the same way)
+    //    would silently spawn the wrong CLI with the wallet password env-var
+    //    injected.
     #[cfg(debug_assertions)]
     {
         if let Ok(p) = std::env::var("SYNAPSEIA_NODE_PATH") {
@@ -2411,7 +2598,13 @@ fn find_synapseia_node(_app: Option<&AppHandle>) -> Result<String, String> {
             let dist_ok = pb.join("dist/index.js").exists();
             let pkg_ok = pb.join("package.json").exists();
             if dist_ok && pkg_ok {
-                return Ok(p);
+                if let Ok(pkg_text) = std::fs::read_to_string(pb.join("package.json")) {
+                    if pkg_text.contains("\"name\": \"@synapseia-network/node\"")
+                        || pkg_text.contains("\"name\":\"@synapseia-network/node\"")
+                    {
+                        return Ok(p);
+                    }
+                }
             }
         }
     }
@@ -3530,10 +3723,13 @@ mod self_update_tests {
 
     use super::*;
 
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
     #[test]
-    fn detects_canonical_marker() {
-        assert!(parse_self_update_cue(
-            "[SELF_UPDATE_RESTART] Update applied, exiting for relaunch."
+    fn detects_canonical_marker_with_matching_nonce() {
+        assert!(parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=12345",
+            NONCE,
         ));
     }
 
@@ -3541,19 +3737,87 @@ mod self_update_tests {
     fn detects_marker_with_timestamp_prefix() {
         // Log forwarders / tee'd terminals can prepend a timestamp before
         // the marker line. The parser must still detect the cue.
-        assert!(parse_self_update_cue(
-            "2026-05-13T22:00:00.000Z [SELF_UPDATE_RESTART] Update applied"
+        assert!(parse_self_update_cue_with_nonce(
+            "2026-05-13T22:00:00.000Z [SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=999",
+            NONCE,
+        ));
+    }
+
+    #[test]
+    fn rejects_marker_with_wrong_nonce() {
+        // The substring is present but the nonce is unknown to an attacker
+        // — must fail closed.
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] nonce=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa v0.8.86 pid=1",
+            NONCE,
+        ));
+    }
+
+    #[test]
+    fn rejects_marker_with_empty_expected_nonce() {
+        // Empty expected_nonce — always rejected, even on a syntactically
+        // valid marker line. Guards against the "no env, accept anything"
+        // footgun.
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=1",
+            "",
+        ));
+        // The back-compat wrapper passes "" — always false.
+        assert!(!parse_self_update_cue(
+            "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=1"
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_substring_marker() {
+        // Pre-F-node-ui-004 marker shape — `[SELF_UPDATE_RESTART] Update
+        // applied, exiting for relaunch.` — must NOT match any longer.
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] Update applied, exiting for relaunch.",
+            NONCE,
+        ));
+    }
+
+    #[test]
+    fn rejects_marker_with_extra_tokens() {
+        // Strict shape: exactly 3 tokens after the bracket. Anything else
+        // — even with a valid nonce — fails closed.
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=1 EXTRA",
+            NONCE,
+        ));
+    }
+
+    #[test]
+    fn rejects_marker_with_bad_version() {
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef vNOTSEMVER pid=1",
+            NONCE,
+        ));
+    }
+
+    #[test]
+    fn rejects_marker_with_bad_pid() {
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=notanumber",
+            NONCE,
         ));
     }
 
     #[test]
     fn ignores_unrelated_lines() {
-        assert!(!parse_self_update_cue("INFO node started"));
-        assert!(!parse_self_update_cue(""));
+        assert!(!parse_self_update_cue_with_nonce("INFO node started", NONCE));
+        assert!(!parse_self_update_cue_with_nonce("", NONCE));
         // Substring of the marker but missing the brackets should NOT match.
-        assert!(!parse_self_update_cue("SELF_UPDATE_RESTART (no brackets)"));
+        assert!(!parse_self_update_cue_with_nonce(
+            "SELF_UPDATE_RESTART (no brackets)",
+            NONCE,
+        ));
         // Different bracketed marker must not false-positive.
-        assert!(!parse_self_update_cue("[SELF_UPDATE_DOWNLOAD] something"));
+        assert!(!parse_self_update_cue_with_nonce(
+            "[SELF_UPDATE_DOWNLOAD] something",
+            NONCE,
+        ));
     }
 
     // We can't pull in `#[tokio::test]` without adding the `macros` /
@@ -3579,8 +3843,9 @@ mod self_update_tests {
             {
                 let mut g = proc.lock().await;
                 assert!(!g.pending_self_update_restart);
-                g.pending_self_update_restart = parse_self_update_cue(
-                    "[SELF_UPDATE_RESTART] Update applied, exiting for relaunch.",
+                g.pending_self_update_restart = parse_self_update_cue_with_nonce(
+                    "[SELF_UPDATE_RESTART] nonce=0123456789abcdef0123456789abcdef v0.8.86 pid=42",
+                    "0123456789abcdef0123456789abcdef",
                 );
             }
 
@@ -3624,7 +3889,7 @@ mod self_update_tests {
             let proc = Arc::new(Mutex::new(NodeProcess::new()));
             {
                 let mut g = proc.lock().await;
-                g.cached_password = Some("secret".into());
+                g.cached_password = Some(zeroize::Zeroizing::new("secret".to_string()));
                 g.pending_self_update_restart = true;
             }
 

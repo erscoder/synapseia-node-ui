@@ -32,6 +32,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 libc = "0.2"
+# F-node-ui-005 (P36): scrub the wallet-password bytes when the cached
+# field is reassigned or the NodeProcess drops. Wrapper-only, no runtime
+# alloc cost.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# F-node-ui-004 (P10): per-spawn nonce for the [SELF_UPDATE_RESTART]
+# stdout marker. `getrandom` was already in the transitive graph; pinning
+# it as a direct dep keeps the supply-chain audit explicit.
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
