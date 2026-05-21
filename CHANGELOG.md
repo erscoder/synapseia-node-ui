@@ -1,5 +1,15 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-21] chore(release): node-ui 0.8.95 (03a9ffd)
+
+Ships the audit-slice node-ui fixes accumulated since 0.8.86:
+F-node-ui-001 BLOCKER (run_command ALLOWED_COMMANDS allowlist + per-subcommand
+argv validation in src-tauri/commands.rs), HIGH bundle (002-006), MED bundle
+(007-013), LOW/STYLE/PERF bundle (014-019), and the Tauri stdin passphrase
+companion to the node env-passphrase blackhole. Bumped to 0.8.95 to align with
+node/coord (version-sync). node-ui downloads the latest @synapseia-network/node
+from npm at startup, so it also picks up node 0.8.95.
+
 ## [2026-05-18] chore(release): bump 0.8.86 lockstep with sub node (be360e0)
 
 Sync with node 0.8.86 (Bug 28 Slice 18 v3 — DiLoCo training inner
