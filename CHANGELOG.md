@@ -1,5 +1,24 @@
 # Changelog — @synapseia/node-ui
 
+## [2026-05-23] release: node-ui 0.8.96 — process-group kill + My Node header
+
+fix(commands): kill the whole node process group on stop/timeout/exit (f1216ca).
+The Stop Node button's `child.kill()` only signalled the direct node PID, so the
+daemon's python/ollama/worker subprocesses survived; `run_command`'s 120s timeout
+returned an error without killing its child, leaving orphaned `claim-rewards`
+processes (5 observed live). Long-running children (node + run_command) are now
+spawned as Unix process-group leaders (`process_group(0)`) and `stop_node`, the
+run_command timeout branch, and `reap_on_exit` group-kill via `libc::killpg`
+(SIGTERM→grace→SIGKILL) with a pgid-0 guard so node-ui can never signal its own
+group. cfg(unix)-gated; self-update respawn/generation/lock semantics unchanged.
+
+fix(ui): My Node header — action buttons top-right, drop dead coordinator prop
+(409b710). `PageHeader` switched `items-center`→`items-start` so Start/Logs/
+Refresh sit on the title row (top-right) and flex-wrap on narrow widths (all 5
+panels). Removed the dead `coordinatorUrl` prop chain (MyNodePanel + App.tsx
+state + the `invoke('coordinator_url')` fetch) whose stale JSDoc claimed it was
+shown in the subtitle.
+
 ## [2026-05-21] chore(release): node-ui 0.8.95 (03a9ffd)
 
 Ships the audit-slice node-ui fixes accumulated since 0.8.86:
