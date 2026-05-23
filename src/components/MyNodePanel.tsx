@@ -14,7 +14,9 @@ interface Props {
   onStart: () => void;
   onStop: () => void;
   onOpenLogs: () => void;
-  onRefresh: () => Promise<void>;
+  // Returns the freshly fetched ChainInfo (shared with StakePanel's
+  // confirmation poll). This panel awaits it and ignores the value.
+  onRefresh: () => Promise<ChainInfo | null>;
   /** When the external lock banner is visible, the Start button must be
    *  disabled so the operator goes through the take-over / clean flow
    *  before retrying. Kept as a plain boolean so the panel stays

@@ -8,7 +8,9 @@ interface Props {
   password: string | null;
   status: NodeStatus;
   chainInfo: ChainInfo | null;
-  onRefresh: () => Promise<void>;
+  // Returns the freshly fetched ChainInfo (shared with StakePanel's
+  // confirmation poll). This panel awaits it and ignores the value.
+  onRefresh: () => Promise<ChainInfo | null>;
 }
 
 export function WalletPanel({ password, status, chainInfo, onRefresh }: Props) {

@@ -290,7 +290,14 @@ function AppInner() {
   // button. Child panels used to `invoke("fetch_chain_info")` directly,
   // which hit the Rust backend but never propagated the result up here —
   // so nothing on screen updated until the next 15 s poll tick.
-  const refreshChainInfo = useCallback(async () => {
+  //
+  // Returns the freshly fetched ChainInfo (or null on failure). Most callers
+  // ignore the return value and rely on the `chainInfo` state update, but
+  // StakePanel needs the fresh value SYNCHRONOUSLY to poll on-chain
+  // confirmation after a stake/unstake — its `chainInfo` prop won't update
+  // mid-async-function, so it reads what this returns instead of the stale
+  // closure value.
+  const refreshChainInfo = useCallback(async (): Promise<ChainInfo | null> => {
     try {
       const info = await invoke<ChainInfo>("fetch_chain_info");
       setChainInfo(info);
@@ -302,8 +309,10 @@ function AppInner() {
         balance_syn: info.syn,
         staked_syn: info.staked,
       }));
+      return info;
     } catch (e) {
       console.warn("[refresh] fetch_chain_info failed:", e);
+      return null;
     }
   }, []);
 

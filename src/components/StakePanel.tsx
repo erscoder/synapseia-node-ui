@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChainInfo, CommandResult, NodeStatus } from "../App";
 import { TrendingUp, TrendingDown, Gift, RefreshCw } from "lucide-react";
@@ -8,7 +8,10 @@ interface Props {
   password: string | null;
   status: NodeStatus;
   chainInfo: ChainInfo | null;
-  onRefresh: () => Promise<void>;
+  // Returns the freshly fetched ChainInfo so the post-stake poll can read
+  // the on-chain value WITHOUT waiting for the `chainInfo` prop to update
+  // (a prop doesn't change mid-async-function — see the poll loop below).
+  onRefresh: () => Promise<ChainInfo | null>;
 }
 
 export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
@@ -18,11 +21,29 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
   const [unstakingLoading, setUnstakingLoading] = useState(false);
   const [claimingLoading, setClaimingLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // True while we're polling on-chain after the CLI returned success. Drives
+  // the "Confirming on-chain…" label so the spinner stays up until the
+  // Staked SYN card actually reflects the change (or we time out).
+  const [confirming, setConfirming] = useState(false);
 
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Soft, non-error notice (e.g. "submitted but RPC hasn't caught up yet").
+  // Rendered in a neutral style — NOT the red error card — because the tx
+  // most likely landed and only the read lagged.
+  const [notice, setNotice] = useState<string | null>(null);
   const [stakeAmount, setStakeAmount] = useState("0");
   const [unstakeAmount, setUnstakeAmount] = useState("0");
+
+  // Unmount guard: the poll loop awaits across several seconds, so we must
+  // not call setState after the panel is gone (user switched tabs mid-poll).
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const stakedMax = chainInfo?.staked ?? 0;
   const availableMax = status.balance_syn ?? 0;
@@ -30,6 +51,17 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
   const unstakeNum = Number.parseFloat(unstakeAmount) || 0;
   const stakeExceedsAvailable = stakeNum > availableMax;
   const unstakeExceedsStaked = unstakeNum > stakedMax;
+
+  // Promise-based sleep (no deps). Used to space out the confirmation poll.
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  // On-chain confirmation poll. Spaced ~3 s apart, capped at ~45 s
+  // (POLL_ATTEMPTS × POLL_INTERVAL_MS). Reads the FRESH staked value from
+  // the value `onRefresh()` RETURNS — the `chainInfo` prop won't update
+  // inside this async function, so relying on it would loop forever on the
+  // stale closure value.
+  const POLL_INTERVAL_MS = 3000;
+  const POLL_ATTEMPTS = 15;
 
   const runCmd = async (
     cmd: string,
@@ -41,6 +73,7 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
     setLoading(true);
     setError(null);
     setResult(null);
+    setNotice(null);
     try {
       const res = await invoke<CommandResult>("run_command", { command: cmd, args, password });
       if (res.success) {
@@ -55,6 +88,91 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
     }
   };
 
+  // Stake/unstake with on-chain confirmation. The CLI returning success only
+  // means the tx was submitted — the Staked SYN card stays stale until the
+  // RPC read reflects it. So after success we keep the spinner up, poll the
+  // chain, and only clear loading once the new value lands (or we time out).
+  const runStakingCmd = async (
+    cmd: "stake" | "unstake",
+    amount: number,
+    amountStr: string,
+    action: string,
+    setLoading: (v: boolean) => void,
+  ) => {
+    if (!password) return;
+    // Capture the BEFORE value so we know what "confirmed" looks like.
+    // Track whether we actually had a baseline: if chainInfo was null at click
+    // (RPC down / first load), a `?? 0` baseline would make any pre-existing
+    // stake look like an instant "confirmed" — so we fail closed below instead.
+    const baselineKnown = chainInfo?.staked != null;
+    const prevStaked = chainInfo?.staked ?? 0;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    setNotice(null);
+    try {
+      const res = await invoke<CommandResult>("run_command", {
+        command: cmd,
+        args: [amountStr],
+        password,
+      });
+      if (!res.success) {
+        // CLI rejected the tx — surface the error and stop, no polling.
+        setError(res.error || res.output || `${action} failed`);
+        return;
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    } finally {
+      // The CLI call is done; clear the per-action flag. From here on the
+      // shared `confirming` flag drives the button label.
+      if (mountedRef.current) setLoading(false);
+    }
+
+    // CLI succeeded. If we never had a prior on-chain baseline, we cannot
+    // honestly confirm a delta — fail closed to a soft notice rather than risk
+    // a false "confirmed" against a pre-existing balance.
+    if (!baselineKnown) {
+      if (mountedRef.current) {
+        setNotice("Submitted on-chain; couldn't read prior balance to confirm — hit Refresh in a moment.");
+      }
+      return;
+    }
+
+    // CLI succeeded — poll on-chain until the change is reflected. 0.99
+    // tolerance absorbs network fees / decimal rounding. Assumes a single
+    // actor: a concurrent stake/unstake from elsewhere can move `staked`
+    // against the expected direction and force the timeout notice.
+    const tolerance = amount * 0.99;
+    if (mountedRef.current) setConfirming(true);
+    try {
+      for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt++) {
+        await sleep(POLL_INTERVAL_MS);
+        if (!mountedRef.current) return;
+        const fresh = await onRefresh();
+        const freshStaked = fresh?.staked ?? prevStaked;
+        const confirmed =
+          cmd === "stake"
+            ? freshStaked >= prevStaked + tolerance
+            : freshStaked <= prevStaked - tolerance;
+        if (confirmed) {
+          if (mountedRef.current) {
+            setResult(`${action} confirmed — staked is now ${fmt(freshStaked)} SYN`);
+          }
+          return;
+        }
+      }
+      // Timed out waiting for the read to catch up. The tx very likely
+      // landed; this is a soft notice, not a failure.
+      if (mountedRef.current) {
+        setNotice("Submitted on-chain; balance not reflected yet — hit Refresh in a moment.");
+      }
+    } finally {
+      if (mountedRef.current) setConfirming(false);
+    }
+  };
+
   const handleStake = () => {
     if (!stakeNum) {
       setError("Enter an amount to stake");
@@ -64,7 +182,7 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
       setError(`Cannot stake more than ${availableMax.toLocaleString()} SYN (available balance)`);
       return;
     }
-    runCmd("stake", [stakeAmount], "Stake", setStakingLoading);
+    runStakingCmd("stake", stakeNum, stakeAmount, "Stake", setStakingLoading);
   };
 
   const handleUnstake = () => {
@@ -76,7 +194,7 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
       setError(`Cannot unstake more than ${stakedMax.toLocaleString()} SYN`);
       return;
     }
-    runCmd("unstake", [unstakeAmount], "Unstake", setUnstakingLoading);
+    runStakingCmd("unstake", unstakeNum, unstakeAmount, "Unstake", setUnstakingLoading);
   };
 
   const handleClaimRewards = () =>
@@ -247,12 +365,13 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
             onClick={handleStake}
             disabled={
               stakingLoading ||
+              confirming ||
               !password ||
               stakeNum <= 0 ||
               stakeExceedsAvailable
             }
           >
-            {stakingLoading ? "Processing…" : "Stake"}
+            {stakingLoading ? "Processing…" : confirming ? "Confirming on-chain…" : "Stake"}
           </Button>
         </Card>
 
@@ -309,12 +428,13 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
             onClick={handleUnstake}
             disabled={
               unstakingLoading ||
+              confirming ||
               !password ||
               unstakeNum <= 0 ||
               unstakeExceedsStaked
             }
           >
-            {unstakingLoading ? "Processing…" : "Unstake"}
+            {unstakingLoading ? "Processing…" : confirming ? "Confirming on-chain…" : "Unstake"}
           </Button>
         </Card>
       </div>
@@ -335,12 +455,21 @@ export function StakePanel({ password, status, chainInfo, onRefresh }: Props) {
             variant="primary"
             size="lg"
             onClick={handleClaimRewards}
-            disabled={claimingLoading || !password || !chainInfo?.rewardsPending}
+            disabled={claimingLoading || confirming || !password || !chainInfo?.rewardsPending}
           >
             {claimingLoading ? "Processing…" : "Claim"}
           </Button>
         </div>
       </Card>
+
+      {/* Soft, non-error notice (timed-out confirmation poll). Neutral
+          cyan style — distinct from both the green success and red error
+          cards — so a slow RPC read doesn't read as a failed transaction. */}
+      {notice && !error && (
+        <Card padding="sm" className="border-cyan-500/30 bg-cyan-500/10">
+          <p className="text-sm text-cyan-200 whitespace-pre-wrap break-words">{notice}</p>
+        </Card>
+      )}
 
       {(result || error) && (
         <Card
