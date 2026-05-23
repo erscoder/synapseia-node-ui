@@ -1567,6 +1567,46 @@ fn send_signal(_pid: u32, _signal: i32) -> Result<(), String> {
     Err("Signal sending not supported on this platform".to_string())
 }
 
+/// Send a signal to an entire Unix process group.
+///
+/// The node CLI spawns its own subprocess tree (python training workers,
+/// ollama calls, other external helpers). `Child::kill()` only delivers a
+/// signal to the direct child PID, so those descendants get reparented to
+/// init and keep running — the node effectively survives a Stop. To kill
+/// the whole tree we spawn each long-running child as the leader of a new
+/// process group (`cmd.process_group(0)`, so the group PGID equals the
+/// child PID), then signal the negative PID with `killpg`, which fans the
+/// signal out to every member of the group.
+///
+/// `pgid` MUST be the leader's PID (== the PGID established at spawn). The
+/// caller is responsible for that invariant.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32, signal: libc::c_int) -> Result<(), String> {
+    if pgid == 0 {
+        // killpg(0, …) would target the *caller's* group — never do that.
+        return Err("refusing to signal process group 0 (our own group)".to_string());
+    }
+    // SAFETY: `killpg` is a syscall wrapper with well-defined behavior for
+    // any pid_t / signal pair. No memory is dereferenced. We never pass 0
+    // (guarded above) so we can't accidentally signal our own group.
+    let rc = unsafe { libc::killpg(pgid as libc::pid_t, signal) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        Err(err.to_string())
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32, _signal: i32) -> Result<(), String> {
+    // TODO(windows): process-group kill requires Job Objects
+    // (CreateJobObject + AssignProcessToJobObject + TerminateJobObject).
+    // Out of scope for now — callers fall back to `child.kill()` on
+    // non-unix, which preserves the prior single-PID behavior.
+    Err("Process-group kill not supported on this platform".to_string())
+}
+
 /// Validate a password by asking the node CLI to decrypt the wallet.
 /// Returns structured success/failure so the UI can show proper errors.
 #[tauri::command]
@@ -1983,6 +2023,16 @@ fn spawn_node_into_state(
         }
     }
 
+    // Make the node CLI the leader of a fresh process group (PGID == its
+    // own PID) so every descendant it spawns — python training workers,
+    // ollama calls, other external helpers — inherits that PGID. On Stop
+    // we then `killpg` the whole group instead of just the direct PID,
+    // otherwise those grandchildren are reparented to init and survive.
+    // tokio's `Command::process_group` mirrors the stable std
+    // `CommandExt::process_group`; gate to unix only.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn node process: {}", e))?;
@@ -2213,8 +2263,29 @@ pub async fn stop_node(state: State<'_, NodeProcessState>) -> Result<bool, Strin
     // mistake itself for the current owner of state when it wakes up.
     node.generation = node.generation.wrapping_add(1);
     if let Some(mut child) = node.child.take() {
+        let pid = child.id();
+
+        // The node CLI spawns its own subprocess tree (python training,
+        // ollama, etc). `child.kill()` only SIGKILLs the direct PID, so
+        // those descendants would be reparented to init and keep running.
+        // The child was spawned as a process-group leader (PGID == its
+        // PID, see spawn_node_into_state), so signal the whole group.
+        #[cfg(unix)]
+        if let Some(p) = pid {
+            // SIGTERM the group first for a clean shutdown (flush logs,
+            // close WS), then escalate to SIGKILL after a brief grace.
+            let _ = kill_process_group(p, libc::SIGTERM);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = kill_process_group(p, libc::SIGKILL);
+        }
+
+        // Belt-and-suspenders: still kill + reap the direct child handle.
+        // On unix this also reaps the zombie of the leader we just
+        // signaled; on non-unix it remains the only kill path (Windows
+        // group-kill via Job Objects is out of scope — see
+        // kill_process_group's non-unix TODO).
         child.kill().await.map_err(|e| e.to_string())?;
-        cleanup_lock_if_ours(child.id());
+        cleanup_lock_if_ours(pid);
         Ok(true)
     } else {
         Err("No node running".to_string())
@@ -2287,14 +2358,12 @@ pub fn reap_on_exit(state: &NodeProcessState) {
 
         // Give the Node.js process a brief window to shut down cleanly
         // (flush logs, close WS connections) before we force-kill it.
+        // The child leads its own process group (PGID == its PID, see
+        // spawn_node_into_state), so signal the WHOLE group — otherwise
+        // its python/ollama subprocess tree outlives the UI as orphans.
         #[cfg(unix)]
         if let Some(p) = pid {
-            let _ = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(p.to_string())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let _ = kill_process_group(p, libc::SIGTERM);
             // Wait up to 2 s for graceful exit before escalating to SIGKILL.
             for _ in 0..20 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2304,8 +2373,12 @@ pub fn reap_on_exit(state: &NodeProcessState) {
                     return;
                 }
             }
+            // Still alive after the grace window — force-kill the group.
+            let _ = kill_process_group(p, libc::SIGKILL);
         }
 
+        // Belt-and-suspenders: reap the direct child handle (also covers
+        // non-unix where group-kill is unavailable).
         let _ = child.start_kill();
         eprintln!("[synapseia-node-ui] reap_on_exit: killed child pid={:?}", pid);
         cleanup_lock_if_ours(pid);
@@ -2427,6 +2500,13 @@ pub async fn run_command(
         cmd.stdin(Stdio::null());
     }
 
+    // Lead a new process group so a timed-out CLI invocation (e.g.
+    // `claim-rewards` hanging on RPC) can be torn down whole. Several
+    // node subcommands themselves shell out; on the timeout branch below
+    // we `killpg` the group so no grandchild orphan survives.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -2463,6 +2543,9 @@ pub async fn run_command(
         }
     }
 
+    // `wait_with_output` consumes the child, so capture its PID first for
+    // the timeout-branch group-kill below.
+    let child_pid = child.id();
     let effective_timeout = timeout_for(&command);
     let output = match tokio::time::timeout(effective_timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
@@ -2477,6 +2560,16 @@ pub async fn run_command(
             });
         }
         Err(_) => {
+            // Timeout: the future dropped here, which closes our pipe
+            // handles but does NOT kill the spawned process or its
+            // children (we observed FIVE orphaned `claim-rewards`
+            // processes from repeated timeouts). The child leads its own
+            // process group (process_group(0) above), so SIGKILL the
+            // whole group to take down it and any subprocess it spawned.
+            #[cfg(unix)]
+            if let Some(p) = child_pid {
+                let _ = kill_process_group(p, libc::SIGKILL);
+            }
             return Ok(CommandResult {
                 success: false,
                 output: String::new(),
@@ -4055,6 +4148,47 @@ pub async fn docking_capabilities() -> Result<DockingCapabilities, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `sleep` spawned as a process-group leader must be taken down by a
+    /// group-kill, and the PID-0 guard must refuse to signal our own group.
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_takes_down_group_leader() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command as StdCommand;
+
+        // Spawn a long-running child as the leader of a fresh group
+        // (PGID == its PID). 30 s is far longer than the test needs.
+        let mut child = {
+            let mut cmd = StdCommand::new("sleep");
+            cmd.arg("30");
+            cmd.process_group(0);
+            cmd.spawn().expect("spawn sleep")
+        };
+        let pid = child.id();
+        assert!(is_pid_alive(pid), "child should be alive right after spawn");
+
+        // SIGKILL the whole group (the leader's PID == its PGID).
+        kill_process_group(pid, libc::SIGKILL).expect("killpg should succeed");
+
+        // Reap the zombie so the liveness probe sees it gone, then poll.
+        let _ = child.wait();
+        let mut gone = false;
+        for _ in 0..50 {
+            if !is_pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "group leader pid={} should be dead after killpg", pid);
+
+        // The PID-0 guard must never signal our own process group.
+        assert!(
+            kill_process_group(0, libc::SIGKILL).is_err(),
+            "kill_process_group(0, ...) must be refused"
+        );
+    }
 
     #[test]
     fn ui_settings_roundtrip_full() {
