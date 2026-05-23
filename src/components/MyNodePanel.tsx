@@ -20,11 +20,6 @@ interface Props {
    *  before retrying. Kept as a plain boolean so the panel stays
    *  ignorant of the lock-source semantics. */
   startDisabled?: boolean;
-  /** F-node-ui-014 (P10): resolved coordinator URL (env override or
-   *  hardcoded official fallback). Surfaced in the subtitle so power
-   *  users can verify which coordinator their node talks to without
-   *  trawling logs. `null` while still loading. */
-  coordinatorUrl?: string | null;
 }
 
 // Aggregated reward groups for the breakdown UI. Each group sums one or more
@@ -115,7 +110,6 @@ export function MyNodePanel({
   onOpenLogs,
   onRefresh,
   startDisabled = false,
-  coordinatorUrl = null,
 }: Props) {
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
@@ -194,11 +188,7 @@ export function MyNodePanel({
     <div className="space-y-6">
       <PageHeader
         title="My Node"
-        subtitle={
-          coordinatorUrl
-            ? `Your node identity, rewards, and health · Coordinator: ${coordinatorUrl}`
-            : "Your node identity, rewards, and health"
-        }
+        subtitle="Your node identity, rewards, and health"
         action={
           <>
             {chainInfo?.isBetaTester && <BetaBadge />}

@@ -147,24 +147,6 @@ function AppInner() {
     current: number;
   }>({ open: false, limit: 0, current: 0 });
   const update = useUpdateChecker();
-  // F-node-ui-014 (P10): surface the active coordinator URL in the
-  // MyNode subtitle. Operators set `COORDINATOR_URL` via the .desktop
-  // launcher (we do not expose a Settings field), so without this the
-  // override is otherwise invisible. Read once on mount; the URL is
-  // resolved at process-start on the Rust side and cannot change while
-  // the desktop is running.
-  const [coordinatorUrl, setCoordinatorUrl] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    invoke<string>("coordinator_url")
-      .then((url) => {
-        if (!cancelled) setCoordinatorUrl(url);
-      })
-      .catch((e) => console.warn("coordinator_url failed", e));
-    return () => {
-      cancelled = true;
-    };
-  }, []);
   // Lock-conflict banner state. Polls ~/.synapseia/node.lock every 3 s so
   // operators see immediate feedback when a CLI-spawned node (or a zombie
   // lock file) is preventing Start from working. Refresh manually after
@@ -630,7 +612,6 @@ function AppInner() {
             onOpenLogs={() => setActivePanel("logs")}
             onRefresh={refreshChainInfo}
             startDisabled={!!externalLock}
-            coordinatorUrl={coordinatorUrl}
           />
         )}
         {activePanel === "wallet" && (
