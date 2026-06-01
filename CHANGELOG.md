@@ -1,6 +1,6 @@
 # Changelog — @synapseia/node-ui
 
-## [Unreleased] 2026-06-01 feat(ui): set MiniMax-M3 as top minimax model in UI provider list (8dd3ae2)
+## [0.8.97] 2026-06-02 feat(ui): set MiniMax-M3 as top minimax model in UI provider list (8dd3ae2)
 
 - The `CLOUD_PROVIDERS_UI` dropdown still listed `MiniMax-M2.7` as the top minimax option while the node already runs `MiniMax-M3` (node `0.9.8`). Flipped the UI `top.modelId` to `MiniMax-M3` so the Tauri model picker matches what the node actually runs.
 - UI string only (`240K window` hint and the `mid`/`budget` entries unchanged). Needs a node-ui release to reach installed binaries.
