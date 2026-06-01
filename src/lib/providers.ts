@@ -79,7 +79,7 @@ export const CLOUD_PROVIDERS_UI: readonly UiCloudProvider[] = [
     label: "MiniMax",
     apiKeyEnvVar: "MINIMAX_API_KEY",
     models: {
-      top: { modelId: "MiniMax-M2.7", hint: "240K window" },
+      top: { modelId: "MiniMax-M3", hint: "240K window" },
       mid: { modelId: "abab7-chat-preview", hint: "balanced" },
       budget: { modelId: "abab6.5s-chat", hint: "fast & cheap" },
     },
