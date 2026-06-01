@@ -1,5 +1,10 @@
 # Changelog — @synapseia/node-ui
 
+## [Unreleased] 2026-06-01 feat(ui): set MiniMax-M3 as top minimax model in UI provider list (8dd3ae2)
+
+- The `CLOUD_PROVIDERS_UI` dropdown still listed `MiniMax-M2.7` as the top minimax option while the node already runs `MiniMax-M3` (node `0.9.8`). Flipped the UI `top.modelId` to `MiniMax-M3` so the Tauri model picker matches what the node actually runs.
+- UI string only (`240K window` hint and the `mid`/`budget` entries unchanged). Needs a node-ui release to reach installed binaries.
+
 ## [2026-05-23] release: node-ui 0.8.96 — process-group kill + My Node header
 
 fix(commands): kill the whole node process group on stop/timeout/exit (f1216ca).
